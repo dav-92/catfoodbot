@@ -740,10 +740,18 @@ class FressnapfScraper(BaseScraper):
     Fressnapf uses Vue 3/Nuxt 3 with client-side rendering, requiring
     Playwright for JavaScript execution. Uses BeautifulSoup for parsing
     the rendered HTML.
+
+    Note: Fressnapf has limited online selection for quality brands compared
+    to Zooplus/Bitiba. They're primarily a retail chain with different brand
+    focus (more mainstream brands like Royal Canin, Animonda, fewer premium
+    brands like Leonardo, Lily's Kitchen).
     """
 
     # Site identification
     SITE_NAME = "fressnapf"
+
+    # Higher price threshold for Fressnapf since they're premium retailer
+    DEFAULT_MAX_PRICE_PER_KG = 15.0
 
     # URL configuration
     BASE_URL = "https://www.fressnapf.de"
@@ -751,48 +759,46 @@ class FressnapfScraper(BaseScraper):
 
     # Fressnapf brand codes for URL filtering
     # Format: ?q=::brand:CODE1:brand:CODE2
+    # Note: Many quality brands (Leonardo, Lily's Kitchen, Wildes Land, etc.)
+    # are not available on Fressnapf - they focus on different brand portfolio
     BRAND_CODES = {
-        # High Quality brands
-        "leonardo": "LEON",
+        # High Quality brands available on Fressnapf
         "mac's": "MACS",
         "catz finefood": "CATZ",
         "mjamjam": "MJAM",
         "animonda": "ANIM",
         "granatapet": "GRAN",
-        "wildes land": "WILD",
         "applaws": "APPL",
-        "lily's kitchen": "LILY",
         "bozita": "BOZI",
-        "terra faelis": "TERF",
-        "venandi animal": "VENA",
-        "carnilove": "CARN",
         "schesir": "SCHE",
         "almo nature": "ALMO",
-        "lucky lou": "LUCK",
-        "tundra": "TUND",
         "edgard & cooper": "EDGA",
-        "cat's love": "CATL",
         "hardys": "HARD",
-        "defu": "DEFU",
-        "the goodstuff": "GOOD",
-        "pure nature": "PURE",
         "strayz": "STRZ",
         # Mid Quality brands
         "miamor": "MIAM",
         "sanabelle": "SANA",
         "happy cat": "HAPC",
-        "royal canin": "ROCA",
+        "royal canin": "ROYA",
         "kattovit": "KATT",
-        "brit care": "BRIT",
         "josera": "JOSE",
         # Other common brands
-        "feringa": "FERI",
-        "smilla": "SMIL",
-        "cosma": "COSM",
         "gourmet": "GOUR",
         "felix": "FELI",
         "sheba": "SHEB",
         "whiskas": "WHIS",
+        "yarrah": "YARR",
+        "hill's": "HILL",
+        "iams": "IAMS",
+        "vitakraft": "VITA",
+        "select gold": "SELE",
+        "schmusy": "SCHM",
+        "real nature": "RENA",
+        "premiere": "PREM",
+        "perfect fit": "PERF",
+        "purina one": "ONE",
+        "mera": "MERA_7",
+        "kitekat": "KITE",
     }
 
     # Concurrency limit for parallel scraping
@@ -1004,12 +1010,12 @@ class FressnapfScraper(BaseScraper):
         brand_params = ':'.join(f'brand:{code}' for code in set(brand_codes))
         return f"{self.CATEGORY_URL}?q=::{brand_params}"
 
-    async def scrape_brand_products(self, brands: list[str], max_price_per_kg: float = None, max_pages: int = 10) -> list[ScrapedProduct]:
+    async def scrape_brand_products(self, brands: list[str], max_price_per_kg: float = None, max_pages: int = 20) -> list[ScrapedProduct]:
         """Scrape wet cat food for specific brands from Fressnapf."""
         # Merge quality brands with user's watched brands
         all_brands = list(set(self.QUALITY_BRANDS + (brands or [])))
 
-        # Get brands that have Fressnapf codes
+        # Get brands that have Fressnapf codes (Fressnapf has limited brand selection)
         valid_brands = []
         for brand in all_brands:
             brand_lower = self.normalize_brand(brand)
@@ -1026,7 +1032,7 @@ class FressnapfScraper(BaseScraper):
             logger.warning("No valid Fressnapf brand codes found")
             return []
 
-        logger.info(f"Scraping Fressnapf for {len(valid_brands)} brands")
+        logger.info(f"Scraping Fressnapf for {len(valid_brands)} brands (of {len(all_brands)} requested)")
 
         all_products = []
         seen_ids = set()
