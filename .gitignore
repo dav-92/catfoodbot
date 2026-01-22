@@ -1,0 +1,17 @@
+# Environment
+.env
+venv/
+__pycache__/
+
+# Database
+*.db
+
+# Logs
+*.log
+
+# IDE
+.vscode/
+.idea/
+
+# Claude
+.claude/

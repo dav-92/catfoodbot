@@ -1,0 +1,18 @@
+services:
+  catfood-alert:
+    build: .
+    container_name: catfood-alert
+    restart: unless-stopped
+    environment:
+      - TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN}
+      - TELEGRAM_CHAT_ID=${TELEGRAM_CHAT_ID}
+      - MIN_DISCOUNT_PERCENT=${MIN_DISCOUNT_PERCENT:-15}
+      - CHECK_INTERVAL_HOURS=${CHECK_INTERVAL_HOURS:-1}
+      - DATABASE_URL=sqlite:///data/catfood.db
+    volumes:
+      - ./data:/app/data
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
