@@ -1673,6 +1673,309 @@ class ZooroyalScraper(BaseScraper):
         return all_products
 
 
+class Zoo24Scraper(BaseScraper):
+    """
+    Scraper for zoo24.de wet cat food.
+
+    Zoo24 is a Shopify-based German pet shop. Uses search-based approach
+    (no category URLs). Products are sorted by price ascending, enabling
+    early termination when price exceeds threshold. Unit price per kg is
+    directly provided in HTML via <unit-price> elements.
+    """
+
+    SITE_NAME = "zoo24"
+    BASE_URL = "https://www.zoo24.de"
+    SEARCH_URL = "https://www.zoo24.de/search"
+    MAX_SEARCH_PAGES = 35
+
+    def _is_wet_food(self, name: str) -> bool:
+        """Check if product is wet cat food (exclude dry food, snacks, accessories)."""
+        name_lower = name.lower()
+
+        for kw in self.EXCLUDE_KEYWORDS:
+            if kw in name_lower:
+                return False
+
+        # Must have at least one wet food indicator or weight pattern (dose/pouch products)
+        if any(kw in name_lower for kw in self.WET_FOOD_KEYWORDS):
+            return True
+
+        # Products with weight patterns (e.g., 6x200g) from search "nassfutter katze" are likely wet food
+        if re.search(r'\d+\s*x\s*\d+\s*g', name_lower):
+            return True
+        if re.search(r'\b\d+\s*g\b', name_lower):
+            return True
+
+        return False
+
+    async def _fetch_page_with_js(self, url: str) -> Optional[str]:
+        """Fetch page with JavaScript rendering using Playwright."""
+        try:
+            delay = random.uniform(settings.request_delay_min, settings.request_delay_max)
+            await asyncio.sleep(delay)
+
+            async with async_playwright() as p:
+                browser = await p.chromium.launch(headless=True)
+                context = await browser.new_context(
+                    locale='de-DE',
+                    user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+                )
+                page = await context.new_page()
+
+                await page.goto(url, wait_until='domcontentloaded', timeout=30000)
+
+                # Wait for product cards to render
+                try:
+                    await page.wait_for_selector('product-card', timeout=20000)
+                except Exception:
+                    logger.warning(f"No product-card elements found on {url}")
+                    await browser.close()
+                    return None
+
+                # Scroll to load lazy content
+                for _ in range(3):
+                    await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+                    await asyncio.sleep(1)
+
+                html = await page.content()
+                await browser.close()
+                return html
+
+        except Exception as e:
+            logger.error(f"Zoo24: Failed to fetch {url}: {e}")
+            return None
+
+    def _parse_products_from_html(self, html: str) -> list[ScrapedProduct]:
+        """Parse products from rendered Zoo24 HTML."""
+        products = []
+        soup = BeautifulSoup(html, 'lxml')
+
+        cards = soup.find_all('product-card')
+        logger.info(f"Zoo24: Found {len(cards)} product cards")
+
+        for card in cards:
+            try:
+                product = self._parse_single_product(card)
+                if product:
+                    products.append(product)
+            except Exception as e:
+                logger.debug(f"Zoo24: Failed to parse card: {e}")
+
+        return products
+
+    def _parse_single_product(self, card) -> Optional[ScrapedProduct]:
+        """Parse a single Zoo24 product card."""
+        # Get handle for external ID
+        handle = card.get('handle', '')
+        if not handle:
+            return None
+
+        external_id = f"zoo24:{handle}"
+
+        # Get product link
+        link = card.find('a', href=re.compile(r'/products/'))
+        if not link:
+            return None
+
+        href = link.get('href', '')
+        url = urljoin(self.BASE_URL, href)
+
+        # Get title
+        title_elem = card.select_one('.product-card__title')
+        name = title_elem.get_text(strip=True) if title_elem else None
+        if not name:
+            return None
+
+        # Filter: only wet cat food
+        if not self._is_wet_food(name):
+            return None
+
+        # Get current price from <sale-price>
+        # Text format can be "Angebotab 1,39 €" or just "1,39 €"
+        sale_price_elem = card.find('sale-price')
+        if not sale_price_elem:
+            return None
+        sale_text = sale_price_elem.get_text(strip=True)
+        # Extract price pattern (digits with comma/dot separator + optional €)
+        price_match = re.search(r'(\d+[.,]\d+)\s*€', sale_text)
+        if not price_match:
+            return None
+        current_price = self._parse_price(price_match.group(1))
+        if not current_price:
+            return None
+
+        # Check for original price (compare-at-price = strikethrough price when on sale)
+        compare_elem = card.find('compare-at-price')
+        original_price = current_price
+        is_on_sale = False
+        sale_tag = None
+
+        if compare_elem:
+            compare_text = compare_elem.get_text(strip=True)
+            if compare_text:
+                compare_price = self._parse_price(compare_text)
+                if compare_price and compare_price > current_price:
+                    original_price = compare_price
+                    is_on_sale = True
+                    discount_pct = int((1 - current_price / original_price) * 100)
+                    sale_tag = f"-{discount_pct}%"
+
+        # Get unit price per kg from <unit-price>
+        unit_price_elem = card.find('unit-price')
+        unit_price_per_kg = None
+        if unit_price_elem:
+            unit_text = unit_price_elem.get_text(strip=True)
+            # Extract number from "(X,XX €/kg)" or "X,XX €/kg"
+            match = re.search(r'([\d.,]+)\s*€/kg', unit_text)
+            if match:
+                unit_price_per_kg = self._parse_price(match.group(1))
+
+        # Determine price per kg values
+        # unit-price shows the current (possibly reduced) price per kg
+        original_price_per_kg = unit_price_per_kg
+        reduced_price_per_kg = None
+
+        if is_on_sale and unit_price_per_kg:
+            # unit-price is the sale price per kg
+            reduced_price_per_kg = unit_price_per_kg
+            # Back-calculate original price per kg from the price ratio
+            if current_price > 0:
+                original_price_per_kg = round(unit_price_per_kg * (original_price / current_price), 2)
+
+        # Extract brand
+        brand = self._extract_brand(name)
+
+        # Extract size and weight
+        size = self._extract_size(name)
+        weight_grams = self._parse_weight_grams(name)
+
+        # If no unit price from HTML, calculate from weight
+        if not original_price_per_kg and weight_grams:
+            if is_on_sale:
+                original_price_per_kg = self._calculate_price_per_kg(original_price, weight_grams)
+                reduced_price_per_kg = self._calculate_price_per_kg(current_price, weight_grams)
+            else:
+                original_price_per_kg = self._calculate_price_per_kg(current_price, weight_grams)
+
+        # Extract variant name
+        variant_name = self._extract_variant_name(name, brand, size)
+
+        return ScrapedProduct(
+            external_id=external_id,
+            name=name,
+            brand=brand,
+            size=size,
+            current_price=current_price,
+            original_price=original_price,
+            is_on_sale=is_on_sale,
+            sale_tag=sale_tag,
+            url=url,
+            site=self.SITE_NAME,
+            weight_grams=weight_grams,
+            original_price_per_kg=original_price_per_kg,
+            reduced_price_per_kg=reduced_price_per_kg,
+            base_product_id=handle,
+            variant_name=variant_name,
+        )
+
+    async def scrape_brand_products(self, brands: list[str], max_price_per_kg: float = None, max_pages: int = None) -> list[ScrapedProduct]:
+        """Scrape wet cat food from Zoo24 search, filtered by brands and price."""
+        all_brands = list(set(self.QUALITY_BRANDS + (brands or [])))
+        brand_set = {self.normalize_brand(b) for b in all_brands}
+
+        scrape_price = max(max_price_per_kg or 0, self.DEFAULT_MAX_PRICE_PER_KG)
+        pages_limit = max_pages or self.MAX_SEARCH_PAGES
+
+        all_products = []
+        seen_ids = set()
+        exceeded_price_count = 0
+
+        for page_num in range(1, pages_limit + 1):
+            page_url = f"{self.SEARCH_URL}?q=nassfutter+katze&sort_by=price-ascending&page={page_num}"
+            logger.info(f"Zoo24: Scraping page {page_num}")
+
+            html = await self._fetch_page_with_js(page_url)
+            if not html:
+                break
+
+            products = self._parse_products_from_html(html)
+            if not products:
+                break
+
+            page_has_valid = False
+            for p in products:
+                # Filter by brand
+                if p.brand and self.normalize_brand(p.brand) not in brand_set:
+                    continue
+
+                # If no brand detected, skip (search returns many unrelated items)
+                if not p.brand:
+                    continue
+
+                price_per_kg = p.reduced_price_per_kg or p.original_price_per_kg
+
+                # Early termination: results are sorted by price ascending
+                # If price per kg exceeds threshold with headroom, stop
+                if price_per_kg and price_per_kg > scrape_price * 1.3:
+                    exceeded_price_count += 1
+                    if exceeded_price_count >= 10:
+                        logger.info(f"Zoo24: Price threshold exceeded consistently, stopping at page {page_num}")
+                        return all_products
+                    continue
+                else:
+                    exceeded_price_count = 0
+
+                if p.external_id not in seen_ids:
+                    seen_ids.add(p.external_id)
+                    all_products.append(p)
+                    page_has_valid = True
+
+            if not page_has_valid and page_num > 3:
+                # No matching products on this page and past initial pages
+                break
+
+        logger.info(f"Zoo24: Found {len(all_products)} products")
+        return all_products
+
+    async def scrape_reduced_products(self, brands: list[str] = None) -> list[ScrapedProduct]:
+        """Scrape reduced/sale products from Zoo24 search."""
+        all_brands = list(set(self.QUALITY_BRANDS + (brands or [])))
+        brand_set = {self.normalize_brand(b) for b in all_brands}
+
+        all_products = []
+        seen_ids = set()
+
+        # Scrape first few pages looking for sale items
+        for page_num in range(1, min(self.MAX_SEARCH_PAGES, 15) + 1):
+            page_url = f"{self.SEARCH_URL}?q=nassfutter+katze&sort_by=price-ascending&page={page_num}"
+            logger.info(f"Zoo24: Scraping reduced items, page {page_num}")
+
+            html = await self._fetch_page_with_js(page_url)
+            if not html:
+                break
+
+            products = self._parse_products_from_html(html)
+            if not products:
+                break
+
+            for p in products:
+                if not p.is_on_sale:
+                    continue
+
+                # Filter by brand
+                if p.brand and self.normalize_brand(p.brand) not in brand_set:
+                    continue
+                if not p.brand:
+                    continue
+
+                if p.external_id not in seen_ids:
+                    seen_ids.add(p.external_id)
+                    all_products.append(p)
+
+        logger.info(f"Zoo24: Found {len(all_products)} reduced products")
+        return all_products
+
+
 async def _scrape_site(scraper, watched_brands: list[str], max_price_per_kg: float = None) -> list[ScrapedProduct]:
     """Scrape a single site for watched brands. Helper for parallel execution."""
     site_name = scraper.SITE_NAME
@@ -1708,7 +2011,7 @@ async def scrape_all_async(watched_brands: list[str] = None, max_price_per_kg: f
     Always scrapes quality brands. If watched_brands is provided, those are also included.
     """
     # Scrape from all sites in parallel (quality brands are always included)
-    scrapers = [ZooplusScraper(), BitibaScraper(), ZooroyalScraper(), FressnapfScraper()]
+    scrapers = [ZooplusScraper(), BitibaScraper(), ZooroyalScraper(), FressnapfScraper(), Zoo24Scraper()]
 
     # Run all scrapers concurrently
     results = await asyncio.gather(

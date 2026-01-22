@@ -372,7 +372,7 @@ def format_cheapest_variant_alert(
 
     msg += "\n\nAvailable on:"
     # Sort: Zooplus first, then Bitiba
-    site_order = {"Zooplus": 0, "Bitiba": 1}
+    site_order = {"Zooplus": 0, "Bitiba": 1, "Zoo24": 4}
     for site_name, ppkg, url in sorted(all_sites, key=lambda x: site_order.get(x[0], 99)):
         msg += f"\n  • [{site_name}]({url}) ({ppkg:.2f}€/kg)"
 
@@ -1042,7 +1042,7 @@ async def scrape_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     from tracker import run_check
 
     await update.message.reply_text(
-        "🔄 Starting full scrape of all sites (Zooplus, Bitiba, Zooroyal)...\n"
+        "🔄 Starting full scrape of all sites (Zooplus, Bitiba, Zooroyal, Fressnapf, Zoo24)...\n"
         "This may take a few minutes."
     )
 
