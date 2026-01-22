@@ -733,6 +733,373 @@ class BitibaScraper(BeautifulSoupScraper):
     CATEGORY_PATH_CHECK = "/shop/katze/katzenfutter_nass"  # Skip category-level URLs
 
 
+class FressnapfScraper(BaseScraper):
+    """
+    Scraper for fressnapf.de wet cat food.
+
+    Fressnapf uses Vue 3/Nuxt 3 with client-side rendering, requiring
+    Playwright for JavaScript execution. Uses BeautifulSoup for parsing
+    the rendered HTML.
+    """
+
+    # Site identification
+    SITE_NAME = "fressnapf"
+
+    # URL configuration
+    BASE_URL = "https://www.fressnapf.de"
+    CATEGORY_URL = "https://www.fressnapf.de/c/katze/katzenfutter/nassfutter/"
+
+    # Fressnapf brand codes for URL filtering
+    # Format: ?q=::brand:CODE1:brand:CODE2
+    BRAND_CODES = {
+        # High Quality brands
+        "leonardo": "LEON",
+        "mac's": "MACS",
+        "catz finefood": "CATZ",
+        "mjamjam": "MJAM",
+        "animonda": "ANIM",
+        "granatapet": "GRAN",
+        "wildes land": "WILD",
+        "applaws": "APPL",
+        "lily's kitchen": "LILY",
+        "bozita": "BOZI",
+        "terra faelis": "TERF",
+        "venandi animal": "VENA",
+        "carnilove": "CARN",
+        "schesir": "SCHE",
+        "almo nature": "ALMO",
+        "lucky lou": "LUCK",
+        "tundra": "TUND",
+        "edgard & cooper": "EDGA",
+        "cat's love": "CATL",
+        "hardys": "HARD",
+        "defu": "DEFU",
+        "the goodstuff": "GOOD",
+        "pure nature": "PURE",
+        "strayz": "STRZ",
+        # Mid Quality brands
+        "miamor": "MIAM",
+        "sanabelle": "SANA",
+        "happy cat": "HAPC",
+        "royal canin": "ROCA",
+        "kattovit": "KATT",
+        "brit care": "BRIT",
+        "josera": "JOSE",
+        # Other common brands
+        "feringa": "FERI",
+        "smilla": "SMIL",
+        "cosma": "COSM",
+        "gourmet": "GOUR",
+        "felix": "FELI",
+        "sheba": "SHEB",
+        "whiskas": "WHIS",
+    }
+
+    # Concurrency limit for parallel scraping
+    MAX_CONCURRENT_BRANDS = 3
+
+    def _is_wet_food(self, name: str, url: str) -> bool:
+        """
+        Check if product is wet cat food.
+
+        For Fressnapf, we're scraping from the wet cat food category
+        (/c/katze/katzenfutter/nassfutter/), so products are wet food by default.
+        Only exclude obvious non-food items like snacks/treats.
+        """
+        name_lower = name.lower()
+
+        # Exclude snacks/treats
+        if any(kw in name_lower for kw in ['snack', 'leckerli', 'treat', 'sticks', 'dreamies', 'knuspies', 'soup', 'suppe']):
+            return False
+
+        # Exclude dry food keywords
+        if any(kw in name_lower for kw in ['trockenfutter', 'trocken', 'kibble']):
+            return False
+
+        # All other products from wet food category are valid
+        return True
+
+    async def _fetch_page_with_js(self, url: str) -> Optional[str]:
+        """Fetch page with JavaScript rendering using Playwright."""
+        try:
+            delay = random.uniform(settings.request_delay_min, settings.request_delay_max)
+            await asyncio.sleep(delay)
+
+            async with async_playwright() as p:
+                browser = await p.chromium.launch(headless=True)
+                context = await browser.new_context(
+                    locale='de-DE',
+                    user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+                )
+                page = await context.new_page()
+
+                await page.goto(url, wait_until='networkidle', timeout=60000)
+
+                # Wait for product teasers to load
+                try:
+                    await page.wait_for_selector('.product-teaser', timeout=15000)
+                except Exception:
+                    logger.warning(f"No product teasers found on {url}")
+
+                # Scroll to load lazy content
+                for _ in range(2):
+                    await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+                    await asyncio.sleep(1)
+
+                html = await page.content()
+                await browser.close()
+                return html
+
+        except Exception as e:
+            logger.error(f"Failed to fetch {url}: {e}")
+            return None
+
+    def _parse_products_from_html(self, html: str) -> list[ScrapedProduct]:
+        """Parse products from rendered Fressnapf HTML."""
+        products = []
+        soup = BeautifulSoup(html, 'lxml')
+
+        teasers = soup.select('.product-teaser')
+        logger.info(f"Found {len(teasers)} product teasers")
+
+        for teaser in teasers:
+            try:
+                product = self._parse_single_product(teaser)
+                if product:
+                    products.append(product)
+            except Exception as e:
+                logger.debug(f"Failed to parse teaser: {e}")
+
+        return products
+
+    def _parse_single_product(self, teaser) -> Optional[ScrapedProduct]:
+        """Parse a single Fressnapf product teaser."""
+        # Get product link and URL
+        link = teaser.select_one('a.pt-header')
+        if not link:
+            return None
+
+        href = link.get('href', '')
+        if not href or '/p/' not in href:
+            return None
+
+        url = urljoin(self.BASE_URL, href)
+
+        # Extract product ID from URL (e.g., /p/product-name-123456/ -> 123456)
+        id_match = re.search(r'-(\d+)/?$', href)
+        external_id = f"{self.SITE_NAME}:{id_match.group(1)}" if id_match else f"{self.SITE_NAME}:{href}"
+
+        # Get brand and name
+        brand_elem = teaser.select_one('.pt-subhead')
+        name_elem = teaser.select_one('.pt-head')
+
+        brand = brand_elem.get_text(strip=True) if brand_elem else None
+        name = name_elem.get_text(strip=True) if name_elem else None
+
+        if not name:
+            return None
+
+        # Get prices
+        price_elem = teaser.select_one('.p-regular-price.p-price:not(.p-per-unit):not(.p-friends-price)')
+        per_kg_elem = teaser.select_one('.p-per-unit')
+
+        current_price = None
+        if price_elem:
+            price_text = price_elem.get_text(strip=True)
+            current_price = self._parse_price(price_text)
+
+        if not current_price:
+            return None
+
+        # Parse price per kg
+        original_price_per_kg = None
+        if per_kg_elem:
+            per_kg_text = per_kg_elem.get_text(strip=True)
+            # Extract number from "(X,XX €/kg)"
+            match = re.search(r'([\d,]+)\s*€/kg', per_kg_text)
+            if match:
+                original_price_per_kg = self._parse_price(match.group(1))
+
+        # Check for sale/strike prices
+        strike_elem = teaser.select_one('.p-strike-price')
+        original_price = current_price
+        is_on_sale = False
+        sale_tag = None
+
+        if strike_elem:
+            strike_text = strike_elem.get_text(strip=True)
+            strike_price = self._parse_price(strike_text)
+            if strike_price and strike_price > current_price:
+                original_price = strike_price
+                is_on_sale = True
+                discount_pct = int((1 - current_price / original_price) * 100)
+                sale_tag = f"-{discount_pct}%"
+
+        # Check for discount badges
+        badges = teaser.select('[class*="badge"]')
+        for badge in badges:
+            badge_text = badge.get_text(strip=True)
+            if '%' in badge_text and '-' in badge_text:
+                match = re.search(r'-?\s*(\d+)\s*%', badge_text)
+                if match:
+                    is_on_sale = True
+                    sale_tag = f"-{match.group(1)}%"
+                    break
+
+        # Filter: only wet cat food
+        if not self._is_wet_food(name, url):
+            return None
+
+        # Parse weight and calculate prices
+        size = self._extract_size(name)
+        weight_grams = self._parse_weight_grams(name)
+
+        # Calculate reduced price per kg if on sale
+        reduced_price_per_kg = None
+        if is_on_sale and weight_grams:
+            reduced_price_per_kg = self._calculate_price_per_kg(current_price, weight_grams)
+
+        # Extract variant name
+        variant_name = self._extract_variant_name(name, brand, size)
+
+        # Base product ID (numeric part of URL)
+        base_product_id = id_match.group(1) if id_match else None
+
+        return ScrapedProduct(
+            external_id=external_id,
+            name=name,
+            brand=brand or self._extract_brand(name),
+            size=size,
+            current_price=current_price,
+            original_price=original_price,
+            is_on_sale=is_on_sale,
+            sale_tag=sale_tag,
+            url=url,
+            site=self.SITE_NAME,
+            weight_grams=weight_grams,
+            original_price_per_kg=original_price_per_kg,
+            reduced_price_per_kg=reduced_price_per_kg,
+            base_product_id=base_product_id,
+            variant_name=variant_name
+        )
+
+    def _get_brand_filter_url(self, brands: list[str]) -> str:
+        """Build URL with brand filter query string."""
+        brand_codes = []
+        for brand in brands:
+            brand_lower = self.normalize_brand(brand)
+            if brand_lower in self.BRAND_CODES:
+                brand_codes.append(self.BRAND_CODES[brand_lower])
+            else:
+                # Try partial match
+                for known_brand, code in self.BRAND_CODES.items():
+                    if brand_lower in known_brand or known_brand in brand_lower:
+                        brand_codes.append(code)
+                        break
+
+        if not brand_codes:
+            return self.CATEGORY_URL
+
+        # Build query string: ?q=::brand:CODE1:brand:CODE2
+        brand_params = ':'.join(f'brand:{code}' for code in set(brand_codes))
+        return f"{self.CATEGORY_URL}?q=::{brand_params}"
+
+    async def scrape_brand_products(self, brands: list[str], max_price_per_kg: float = None, max_pages: int = 10) -> list[ScrapedProduct]:
+        """Scrape wet cat food for specific brands from Fressnapf."""
+        # Merge quality brands with user's watched brands
+        all_brands = list(set(self.QUALITY_BRANDS + (brands or [])))
+
+        # Get brands that have Fressnapf codes
+        valid_brands = []
+        for brand in all_brands:
+            brand_lower = self.normalize_brand(brand)
+            if brand_lower in self.BRAND_CODES:
+                valid_brands.append(brand)
+            else:
+                # Try partial match
+                for known_brand in self.BRAND_CODES.keys():
+                    if brand_lower in known_brand or known_brand in brand_lower:
+                        valid_brands.append(brand)
+                        break
+
+        if not valid_brands:
+            logger.warning("No valid Fressnapf brand codes found")
+            return []
+
+        logger.info(f"Scraping Fressnapf for {len(valid_brands)} brands")
+
+        all_products = []
+        seen_ids = set()
+
+        # Build URL with all brand filters
+        url = self._get_brand_filter_url(valid_brands)
+        logger.info(f"Fressnapf brand filter URL: {url}")
+
+        for page_num in range(1, max_pages + 1):
+            page_url = f"{url}&page={page_num}" if page_num > 1 else url
+            logger.info(f"Scraping Fressnapf page {page_num}")
+
+            html = await self._fetch_page_with_js(page_url)
+            if not html:
+                break
+
+            products = self._parse_products_from_html(html)
+            if not products:
+                break
+
+            new_count = 0
+            for p in products:
+                # Apply price filter
+                scrape_price = max(max_price_per_kg or 0, self.DEFAULT_MAX_PRICE_PER_KG)
+                price_per_kg = p.reduced_price_per_kg or p.original_price_per_kg
+                if price_per_kg and price_per_kg > scrape_price * 1.3:  # 30% headroom
+                    continue
+
+                if p.external_id not in seen_ids:
+                    seen_ids.add(p.external_id)
+                    all_products.append(p)
+                    new_count += 1
+
+            if new_count == 0 and page_num > 1:
+                break
+
+        logger.info(f"Fressnapf found {len(all_products)} products")
+        return all_products
+
+    async def scrape_reduced_products(self, brands: list[str] = None) -> list[ScrapedProduct]:
+        """Scrape reduced/sale products from Fressnapf."""
+        all_products = []
+        seen_ids = set()
+
+        # Use sale filter: aktionen=angebote
+        base_url = f"{self.CATEGORY_URL}?aktionen=angebote"
+
+        # Add brand filter if specified
+        if brands:
+            brand_url = self._get_brand_filter_url(brands)
+            if '?' in brand_url:
+                base_url = f"{brand_url}&aktionen=angebote"
+
+        logger.info(f"Scraping Fressnapf reduced items: {base_url}")
+
+        html = await self._fetch_page_with_js(base_url)
+        if not html:
+            return []
+
+        products = self._parse_products_from_html(html)
+
+        for p in products:
+            if p.external_id not in seen_ids:
+                # Mark as on sale if from deals page
+                if not p.is_on_sale:
+                    p.is_on_sale = True
+                seen_ids.add(p.external_id)
+                all_products.append(p)
+
+        logger.info(f"Fressnapf found {len(all_products)} reduced products")
+        return all_products
+
+
 class ZooroyalScraper(BaseScraper):
     """
     Scraper for zooroyal.de wet cat food.
@@ -1335,7 +1702,7 @@ async def scrape_all_async(watched_brands: list[str] = None, max_price_per_kg: f
     Always scrapes quality brands. If watched_brands is provided, those are also included.
     """
     # Scrape from all sites in parallel (quality brands are always included)
-    scrapers = [ZooplusScraper(), BitibaScraper(), ZooroyalScraper()]
+    scrapers = [ZooplusScraper(), BitibaScraper(), ZooroyalScraper(), FressnapfScraper()]
 
     # Run all scrapers concurrently
     results = await asyncio.gather(
