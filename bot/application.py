@@ -1,11 +1,11 @@
 from typing import Optional
 import logging
 from telegram import Bot
-from telegram.ext import Application, CommandHandler
+from telegram.ext import Application, CommandHandler, CallbackQueryHandler
 
 from config import settings
 from bot.handlers import (
-    start_command, brands_command, addbrand_command, removebrand_command,
+    start_command, brands_command, addbrand_command, addbrand_callback, removebrand_command,
     listbrands_command, setmaxprice_command, status_command,
     reset_command, scrape_command, help_command
 )
@@ -24,6 +24,7 @@ def create_bot_application() -> Optional[Application]:
     app.add_handler(CommandHandler("start", start_command))
     app.add_handler(CommandHandler("brands", brands_command))
     app.add_handler(CommandHandler("addbrand", addbrand_command))
+    app.add_handler(CallbackQueryHandler(addbrand_callback, pattern="^addbrand:"))
     app.add_handler(CommandHandler("removebrand", removebrand_command))
     app.add_handler(CommandHandler("listbrands", listbrands_command))
     app.add_handler(CommandHandler("setmaxprice", setmaxprice_command))

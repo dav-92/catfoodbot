@@ -1,6 +1,6 @@
 import asyncio
 import logging
-from telegram import Update
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import ContextTypes
 
 from database import get_session, get_or_create_preferences, UserPreferences, Product, AlertSent
@@ -96,6 +96,69 @@ async def brands_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             parse_mode="Markdown"
         )
 
+def parse_brand_input(input_text: str) -> list[str]:
+    """Parse brand input, supporting both comma-separated and space-separated formats.
+
+    Handles multi-word brand names by matching against AVAILABLE_BRANDS.
+    """
+    # If commas present, use comma separation
+    if "," in input_text:
+        return [b.strip() for b in input_text.split(",") if b.strip()]
+
+    # Space-separated: try to match multi-word brands
+    words = input_text.split()
+    if not words:
+        return []
+
+    # Build a lowercase lookup for known brands
+    brand_lookup = {b.lower(): b for b in AVAILABLE_BRANDS}
+
+    result = []
+    i = 0
+    while i < len(words):
+        matched = False
+        # Try matching longest possible brand name first (up to 4 words)
+        for length in range(min(4, len(words) - i), 0, -1):
+            candidate = " ".join(words[i:i+length]).lower()
+            if candidate in brand_lookup:
+                result.append(brand_lookup[candidate])
+                i += length
+                matched = True
+                break
+
+        if not matched:
+            # No exact match, add single word for fuzzy matching later
+            result.append(words[i])
+            i += 1
+
+    return result
+
+
+def find_brand_suggestions(query: str, limit: int = 5) -> list[str]:
+    """Find brand suggestions for a query string."""
+    query_lower = query.lower()
+
+    # Exact match
+    for brand in AVAILABLE_BRANDS:
+        if brand.lower() == query_lower:
+            return [brand]
+
+    # Partial matches (brand contains query or query contains brand)
+    matches = []
+    for brand in AVAILABLE_BRANDS:
+        brand_lower = brand.lower()
+        if query_lower in brand_lower or brand_lower in query_lower:
+            matches.append(brand)
+
+    # If no partial matches, try prefix matching
+    if not matches:
+        for brand in AVAILABLE_BRANDS:
+            if brand.lower().startswith(query_lower):
+                matches.append(brand)
+
+    return matches[:limit]
+
+
 async def addbrand_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle /addbrand command."""
     chat_id = str(update.effective_chat.id)
@@ -105,18 +168,19 @@ async def addbrand_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "Usage: /addbrand <brand name(s)>\n\n"
             "Examples:\n"
             "  /addbrand Animonda\n"
+            "  /addbrand macs wild freedom leonardo\n"
             "  /addbrand MAC's, Wild Freedom, Leonardo\n\n"
             "Use /listbrands to see available brands."
         )
         return
 
     input_text = " ".join(context.args)
-    brand_inputs = [b.strip() for b in input_text.split(",") if b.strip()]
+    brand_inputs = parse_brand_input(input_text)
 
     added_brands = []
     already_added = []
     unknown_brands = []
-    ambiguous = []
+    suggestions_for_unknown = {}  # brand -> [suggestions]
 
     session = get_session()
     try:
@@ -129,22 +193,20 @@ async def addbrand_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             session.add(prefs)
 
         for brand in brand_inputs:
+            # Check exact match (case-insensitive)
             matched_brand = None
             for known in AVAILABLE_BRANDS:
                 if known.lower() == brand.lower():
                     matched_brand = known
                     break
 
+            # Try fuzzy matching if no exact match
             if not matched_brand:
-                partial_matches = []
-                for known in AVAILABLE_BRANDS:
-                    if brand.lower() in known.lower() or known.lower() in brand.lower():
-                        partial_matches.append(known)
-
-                if len(partial_matches) == 1:
-                    matched_brand = partial_matches[0]
-                elif len(partial_matches) > 1:
-                    ambiguous.append(f"{brand} ({', '.join(partial_matches)})")
+                suggestions = find_brand_suggestions(brand)
+                if len(suggestions) == 1:
+                    matched_brand = suggestions[0]
+                elif suggestions:
+                    suggestions_for_unknown[brand] = suggestions
                     continue
 
             if not matched_brand:
@@ -158,6 +220,7 @@ async def addbrand_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         session.commit()
 
+        # Build response message
         msg_parts = []
         if added_brands:
             msg_parts.append(f"✅ Added: {', '.join(added_brands)}")
@@ -165,14 +228,27 @@ async def addbrand_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             msg_parts.append(f"ℹ️ Already watching: {', '.join(already_added)}")
         if unknown_brands:
             msg_parts.append(f"❌ Unknown: {', '.join(unknown_brands)}")
-        if ambiguous:
-            msg_parts.append(f"❓ Ambiguous: {'; '.join(ambiguous)}")
 
         if added_brands:
             msg_parts.append(f"\nCurrent brands: {', '.join(prefs.get_brands_list())}")
 
-        await update.message.reply_text("\n".join(msg_parts), parse_mode="Markdown")
+        if msg_parts:
+            await update.message.reply_text("\n".join(msg_parts), parse_mode="Markdown")
 
+        # Show suggestion buttons for ambiguous brands
+        for unknown, suggestions in suggestions_for_unknown.items():
+            keyboard = []
+            for sugg in suggestions[:4]:  # Max 4 suggestions per row
+                keyboard.append(InlineKeyboardButton(sugg, callback_data=f"addbrand:{sugg}"))
+
+            reply_markup = InlineKeyboardMarkup([keyboard])
+            await update.message.reply_text(
+                f"❓ Did you mean one of these for *{unknown}*?",
+                reply_markup=reply_markup,
+                parse_mode="Markdown"
+            )
+
+        # Show deals for newly added brands
         if added_brands and prefs.max_price_per_kg is not None:
             deals = get_deals_from_db(prefs, session, brands_filter=added_brands)
             if deals:
@@ -205,6 +281,56 @@ async def addbrand_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "Set /setmaxprice first to see deals!",
                 parse_mode="Markdown"
             )
+    finally:
+        session.close()
+
+
+async def addbrand_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle callback from brand suggestion buttons."""
+    query = update.callback_query
+    await query.answer()
+
+    data = query.data
+    if not data.startswith("addbrand:"):
+        return
+
+    brand = data[len("addbrand:"):]
+    chat_id = str(update.effective_chat.id)
+
+    session = get_session()
+    try:
+        prefs = session.query(UserPreferences).filter(
+            UserPreferences.chat_id == chat_id
+        ).first()
+
+        if not prefs:
+            prefs = UserPreferences(chat_id=chat_id)
+            session.add(prefs)
+
+        if prefs.add_brand(brand):
+            session.commit()
+            await query.edit_message_text(f"✅ Added: {brand}")
+
+            # Check for deals
+            if prefs.max_price_per_kg is not None:
+                deals = get_deals_from_db(prefs, session, brands_filter=[brand])
+                if deals:
+                    freshness = format_freshness_string(get_data_freshness())
+                    await query.message.reply_text(
+                        f"📦 Found {len(deals)} deal(s) for {brand}:",
+                        parse_mode="Markdown"
+                    )
+                    # Send deals (need to create a fake update for send_deals_response)
+                    cheapest_deals = find_cheapest_variants(deals)
+                    for product, price, ppkg, other_sites in cheapest_deals[:5]:
+                        message = format_cheapest_variant_alert(product, price, prefs.max_price_per_kg, other_sites)
+                        await query.message.reply_text(
+                            message,
+                            parse_mode="Markdown",
+                            disable_web_page_preview=False
+                        )
+        else:
+            await query.edit_message_text(f"ℹ️ Already watching: {brand}")
     finally:
         session.close()
 
