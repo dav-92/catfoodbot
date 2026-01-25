@@ -1,23 +1,31 @@
-# Claude Code Memory for catfood project
+# Claude Code Memory for CatFoodBot
 
-## Important Reminders
-
-### Always restart the bot after code changes!
-After modifying any Python files (notifier.py, scraper.py, main.py, database.py, etc.), always restart the bot:
+## ⚠️ CRITICAL DEPLOYMENT INSTRUCTION
+**You MUST rebuild the container to apply ANY code changes.**
+Can NOT just restart. The code is copied into the image, not mounted.
 ```bash
-pkill -f "python3.*main.py" 2>/dev/null; sleep 1; nohup python3 /root/catfood/main.py > /root/catfood/bot.log 2>&1 &
+docker-compose up --build -d
 ```
 
 ## Project Structure
-- `main.py` - Entry point, runs scheduler and bot
-- `notifier.py` - Telegram bot commands and alert formatting
-- `scraper.py` - Zooplus/Bitiba/Zooroyal price scrapers (3 sites, parallel scraping)
-- `database.py` - SQLAlchemy models (Product, PriceHistory, AlertSent, UserPreferences)
-- `config.py` - Settings from environment variables
-- `tracker.py` - Price tracking logic, run_check() for scheduled scrapes
+- `main.py` - Entry point, starts Scheduler and Telegram Bot
+- `bot/` - Telegram bot implementation
+    - `application.py` - Bot setup and handlers registration
+    - `handlers.py` - Command handlers (`/status`, `/scrape`, etc.)
+- `services/` - Business logic
+    - `alert_service.py` - Logic for sending alerts
+    - `deal_service.py` - Logic for finding deals
+- `scraper.py` - Async scrapers for Zooplus, Bitiba, Zooroyal, etc.
+- `tracker.py` - Orchestrates scraping and DB updates (runs in background)
+- `database.py` - SQLAlchemy models (`WatchedBrand`, `UserPreferences` with eager loading)
+- `migrate_brands.py` - Script to migrate legacy comma-separated brands to `WatchedBrand` table
 
-## Commands
-- `/scrape` - Manually trigger full scrape of all 3 sites
-- `/reset` - Clear alert history and re-send existing deals
-- `/setmaxprice` - Set max price per kg filter
-- `/addbrand` / `/removebrand` - Manage watched brands
+## Common Tasks
+- **Manual Scrape**: Send `/scrape` to the bot.
+- **Check Status**: Send `/status` to see last check time and next scheduled run.
+- **Add Brand**: `/addbrand macs` (automatically normalizes matches)
+
+## Architecture Notes
+- **Async Only**: HTML parsing and DB commits are offloaded to threads (`asyncio.to_thread`) to prevent blocking the event loop.
+- **Database**: Uses `joinedload` for `UserPreferences.brands` to prevent `DetachedInstanceError`.
+- **Migration**: Run `python migrate_brands.py` inside the container if upgrading from v1.

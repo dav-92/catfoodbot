@@ -12,10 +12,27 @@ from database import get_or_create_preferences
 
 logger = logging.getLogger(__name__)
 
+# Global state to track if a check is currently running
+_is_running = False
+_last_run_start = None
 
-def save_product(scraped: ScrapedProduct) -> tuple[int, bool]:
+def is_check_running() -> bool:
+    """Check if a price check is currently in progress."""
+    return _is_running
+
+def get_last_run_start() -> Optional[datetime]:
+    """Get the start time of the last run."""
+    return _last_run_start
+
+
+
+def save_product(scraped: ScrapedProduct, session=None) -> tuple[int, bool]:
     """Save or update a product in the database. Returns (product_id, is_new)."""
-    session = get_session()
+    close_session = False
+    if not session:
+        session = get_session()
+        close_session = True
+        
     try:
         # Check if product exists
         product = session.query(Product).filter(
@@ -38,7 +55,11 @@ def save_product(scraped: ScrapedProduct) -> tuple[int, bool]:
                 is_wet_food=True
             )
             session.add(product)
-            session.commit()
+            # Flush to get ID if we are in a transaction
+            session.flush()
+            if close_session:
+                session.commit()
+            
             is_new = True
             logger.info(f"New product: {product.name} (variant: {scraped.variant_name})")
         else:
@@ -50,17 +71,23 @@ def save_product(scraped: ScrapedProduct) -> tuple[int, bool]:
             product.base_product_id = scraped.base_product_id or product.base_product_id
             product.variant_name = scraped.variant_name or product.variant_name
             product.updated_at = datetime.utcnow()
-            session.commit()
+            if close_session:
+                session.commit()
 
         return product.id, is_new
 
     finally:
-        session.close()
+        if close_session:
+            session.close()
 
 
-def save_price(product_id: int, scraped: ScrapedProduct) -> int:
+def save_price(product_id: int, scraped: ScrapedProduct, session=None) -> int:
     """Record a price point for a product. Returns price_id."""
-    session = get_session()
+    close_session = False
+    if not session:
+        session = get_session()
+        close_session = True
+        
     try:
         price = PriceHistory(
             product_id=product_id,
@@ -72,17 +99,24 @@ def save_price(product_id: int, scraped: ScrapedProduct) -> int:
             reduced_price_per_kg=scraped.reduced_price_per_kg
         )
         session.add(price)
-        session.commit()
-        session.refresh(price)
+        session.flush() # Ensure ID is generated
+        if close_session:
+            session.commit()
+            session.refresh(price)
         return price.id
 
     finally:
-        session.close()
+        if close_session:
+            session.close()
 
 
-def get_historical_average(product_id: int, days: int = 30) -> Optional[float]:
+def get_historical_average(product_id: int, days: int = 30, session=None) -> Optional[float]:
     """Get the average price for a product over the last N days."""
-    session = get_session()
+    close_session = False
+    if not session:
+        session = get_session()
+        close_session = True
+        
     try:
         cutoff = datetime.utcnow() - timedelta(days=days)
         result = session.query(func.avg(PriceHistory.current_price)).filter(
@@ -93,12 +127,13 @@ def get_historical_average(product_id: int, days: int = 30) -> Optional[float]:
         return result
 
     finally:
-        session.close()
+        if close_session:
+            session.close()
 
 
-def check_for_price_drop(product: Product, price: PriceHistory) -> bool:
+def check_for_price_drop(product: Product, price: PriceHistory, session=None) -> bool:
     """Check if the current price is lower than historical average."""
-    avg_price = get_historical_average(product.id)
+    avg_price = get_historical_average(product.id, session=session)
 
     if not avg_price:
         # No historical data yet
@@ -153,7 +188,7 @@ def check_under_max_price(product: Product, price: PriceHistory, chat_id: str) -
 
 async def process_products(products: list[ScrapedProduct]) -> dict:
     """Process scraped products, save to DB, and send alerts."""
-    from notifier import send_alerts_grouped
+    from services.alert_service import send_alerts_grouped
 
     stats = {
         "total": len(products),
@@ -163,33 +198,60 @@ async def process_products(products: list[ScrapedProduct]) -> dict:
         "on_sale": 0
     }
 
-    # Collect products that should be alerted (for grouped sending)
+    # Run the heavy synchronous DB operations in a separate thread
+    batch_stats, products_to_alert = await asyncio.to_thread(_save_products_batch_sync, products)
+    
+    # Merge stats
+    stats["new_products"] = batch_stats["new_products"]
+    stats["price_updates"] = batch_stats["price_updates"]
+    stats["on_sale"] = batch_stats["on_sale"]
+
+    # Send alerts grouped by base_product_id + price
+    if products_to_alert:
+        alerts_count = await send_alerts_grouped(products_to_alert)
+        stats["alerts_sent"] = alerts_count
+
+    return stats
+
+
+def _save_products_batch_sync(products: list[ScrapedProduct]) -> tuple[dict, list]:
+    """
+    Synchronous function to save a batch of products to DB.
+    Should be run in a separate thread to avoid blocking the event loop.
+    Returns (stats_dict, list_of_alert_tuples).
+    """
+    stats = {
+        "new_products": 0,
+        "price_updates": 0,
+        "on_sale": 0
+    }
     products_to_alert = []
 
-    for scraped in products:
-        try:
-            # Save product and get its ID
-            product_id, is_new = save_product(scraped)
-            if is_new:
-                stats["new_products"] += 1
-
-            # Save price and get its ID
-            price_id = save_price(product_id, scraped)
-            stats["price_updates"] += 1
-
-            if scraped.is_on_sale:
-                stats["on_sale"] += 1
-
-            # Check if we should send an alert using fresh session
-            session = get_session()
+    # Use a single session for all processing
+    session = get_session()
+    try:
+        for scraped in products:
             try:
-                fresh_product = session.query(Product).get(product_id)
+                # Save product and get its ID (using shared session)
+                product_id, is_new = save_product(scraped, session=session)
+                if is_new:
+                    stats["new_products"] += 1
+
+                # Save price and get its ID (using shared session)
+                price_id = save_price(product_id, scraped, session=session)
+                stats["price_updates"] += 1
+
+                if scraped.is_on_sale:
+                    stats["on_sale"] += 1
+
+                # Determine if we should alert
+                # We need to query specific objects to ensure they are attached to session
                 fresh_price = session.query(PriceHistory).get(price_id)
+                fresh_product = session.query(Product).get(product_id)
 
                 if not fresh_product or not fresh_price:
                     continue
 
-                # Determine if this product might be worth alerting about
                 should_alert = False
 
                 # Alert if explicitly on sale with any discount
@@ -197,7 +259,7 @@ async def process_products(products: list[ScrapedProduct]) -> dict:
                     should_alert = True
 
                 # Also alert if price dropped compared to historical average
-                if not should_alert and check_for_price_drop(fresh_product, fresh_price):
+                if not should_alert and check_for_price_drop(fresh_product, fresh_price, session=session):
                     should_alert = True
 
                 # Also alert if product has a price per kg (could be under someone's threshold)
@@ -208,65 +270,73 @@ async def process_products(products: list[ScrapedProduct]) -> dict:
                 if should_alert:
                     # Collect for grouped sending instead of sending immediately
                     products_to_alert.append((fresh_product.id, fresh_price.id))
-            finally:
-                session.close()
 
-        except Exception as e:
-            logger.error(f"Error processing product {scraped.name}: {e}")
+            except Exception as e:
+                logger.error(f"Error processing product {scraped.name}: {e}")
+                session.rollback()
+        
+        # Commit all changes at the end
+        session.commit()
+        
+    finally:
+        session.close()
 
-    # Send alerts grouped by base_product_id + price
-    if products_to_alert:
-        alerts_count = await send_alerts_grouped(products_to_alert)
-        stats["alerts_sent"] = alerts_count
-
-    return stats
+    return stats, products_to_alert
 
 
 async def run_check():
     """Run a full price check cycle."""
-    logger.info("Starting price check...")
-
-    # Initialize database
-    init_db()
-
-    # Get all watched brands and lowest max price from all users
-    session = get_session()
+    global _is_running, _last_run_start
+    _is_running = True
+    _last_run_start = datetime.utcnow()
+    
     try:
-        from database import UserPreferences
-        all_users = session.query(UserPreferences).filter(
-            UserPreferences.alerts_enabled == True
-        ).all()
+        logger.info("Starting price check...")
 
-        # Collect all unique watched brands from all users
-        watched_brands = set()
-        price_ceiling = None  # Track highest max_price (to include products for all users)
-        for user in all_users:
-            watched_brands.update(user.get_brands_list())
-            if user.max_price_per_kg is not None:
-                if price_ceiling is None or user.max_price_per_kg > price_ceiling:
-                    price_ceiling = user.max_price_per_kg
+        # Initialize database
+        init_db()
 
-        logger.info(f"Scraping for {len(all_users)} users, {len(watched_brands)} brands")
+        # Get all watched brands and lowest max price from all users
+        session = get_session()
+        try:
+            from database import UserPreferences
+            all_users = session.query(UserPreferences).filter(
+                UserPreferences.alerts_enabled == True
+            ).all()
+
+            # Collect all unique watched brands from all users
+            watched_brands = set()
+            price_ceiling = None  # Track highest max_price (to include products for all users)
+            for user in all_users:
+                watched_brands.update(user.get_brands_list())
+                if user.max_price_per_kg is not None:
+                    if price_ceiling is None or user.max_price_per_kg > price_ceiling:
+                        price_ceiling = user.max_price_per_kg
+
+            logger.info(f"Scraping for {len(all_users)} users, {len(watched_brands)} brands")
+        finally:
+            session.close()
+
+        # Scrape products (including watched brands specifically, filtered by max price)
+        products = await scrape_all_async(watched_brands=list(watched_brands), max_price_per_kg=price_ceiling)
+
+        if not products:
+            logger.warning("No products scraped!")
+            return
+
+        # Process and send alerts
+        stats = await process_products(products)
+
+        logger.info(
+            f"Check complete: {stats['total']} products, "
+            f"{stats['new_products']} new, {stats['on_sale']} on sale, "
+            f"{stats['alerts_sent']} alerts sent"
+        )
+
+        return stats
     finally:
-        session.close()
+        _is_running = False
 
-    # Scrape products (including watched brands specifically, filtered by max price)
-    products = await scrape_all_async(watched_brands=list(watched_brands), max_price_per_kg=price_ceiling)
-
-    if not products:
-        logger.warning("No products scraped!")
-        return
-
-    # Process and send alerts
-    stats = await process_products(products)
-
-    logger.info(
-        f"Check complete: {stats['total']} products, "
-        f"{stats['new_products']} new, {stats['on_sale']} on sale, "
-        f"{stats['alerts_sent']} alerts sent"
-    )
-
-    return stats
 
 
 def run_check_sync():

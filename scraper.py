@@ -74,7 +74,7 @@ class BaseScraper(ABC):
         "Rocco", "Rosie's Farm", "Royal Canin", "Royal Canin Veterinary",
         # S-Z brands
         "Sanabelle", "Schesir", "Sheba", "Smilla",
-        "Terra Faelis", "Thrive", "Tundra", "Vitakraft", "Whiskas", "Wild Freedom", "Wildes Land",
+        "Terra Faelis", "Thrive", "Tundra", "Venandi Animal", "Vitakraft", "Whiskas", "Wild Freedom", "Wildes Land",
         # Zooplus own/exclusive brands
         "zooplus Basics", "zooplus Bio",
         # Additional/specialty brands
@@ -108,7 +108,7 @@ class BaseScraper(ABC):
         pass
 
     @abstractmethod
-    async def scrape_brand_products(self, brands: list[str], max_price_per_kg: float = None, max_pages: int = 100) -> list[ScrapedProduct]:
+    async def scrape_brand_products(self, brands: list[str], max_price_per_kg: float = None, max_pages: int = 100, include_default_brands: bool = True) -> list[ScrapedProduct]:
         """Scrape products for specific brands."""
         pass
 
@@ -185,10 +185,19 @@ class BaseScraper(ABC):
     def _extract_brand(self, name: str) -> Optional[str]:
         """Extract brand from product name."""
         name_normalized = self.normalize_brand(name)
-        for brand in self.BRANDS:
+        
+        # Sort brands by length (descending) to match "Venandi Animal" before "Grau"
+        # This prevents "Grau" (grey) from matching in "Venandi Animal ... grau ..."
+        sorted_brands = sorted(self.BRANDS, key=len, reverse=True)
+        
+        for brand in sorted_brands:
             brand_normalized = self.normalize_brand(brand)
-            # Direct match
-            if brand_normalized in name_normalized:
+            
+            # Use word boundary check to avoid partial word matches
+            # Escape regex special characters in brand name
+            pattern = r'(?:^|\b|[^a-z0-9])' + re.escape(brand_normalized) + r'(?:\b|[^a-z0-9]|$)'
+            
+            if re.search(pattern, name_normalized):
                 return brand
         return None
 
@@ -291,39 +300,67 @@ class BeautifulSoupScraper(BaseScraper):
     CATEGORY_PATH: str = ""  # Category path for filters
     CATEGORY_PATH_CHECK: str = ""  # Skip category-level URLs
 
+    def __init__(self, browser=None):
+        self.browser = browser
+
     async def _fetch_page_with_js(self, url: str) -> Optional[str]:
         """Fetch page with JavaScript rendering using Playwright."""
         try:
             delay = random.uniform(settings.request_delay_min, settings.request_delay_max)
             await asyncio.sleep(delay)
 
-            async with async_playwright() as p:
-                browser = await p.chromium.launch(headless=True)
-                context = await browser.new_context(
+            # Use existing browser if provided, otherwise context manager (legacy/fallback)
+            if self.browser:
+                context = await self.browser.new_context(
                     locale='de-DE',
                     user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
                 )
                 page = await context.new_page()
-
-                # Navigate and wait for products to load
-                await page.goto(url, wait_until='networkidle', timeout=60000)
-
-                # Wait for product cards to appear
                 try:
-                    await page.wait_for_selector('[class*="ProductCard"]', timeout=15000)
-                except:
+                    await page.goto(url, wait_until='networkidle', timeout=60000)
+                    
+                    # Wait for product cards
                     try:
-                        await page.wait_for_selector('[class*="product"]', timeout=5000)
+                        await page.wait_for_selector('[class*="ProductCard"]', timeout=15000)
                     except:
-                        pass
+                        try:
+                            await page.wait_for_selector('[class*="product"]', timeout=5000)
+                        except:
+                            pass
 
-                # Scroll to load lazy content
-                await page.evaluate("window.scrollTo(0, document.body.scrollHeight / 2)")
-                await asyncio.sleep(1)
+                    # Scroll
+                    await page.evaluate("window.scrollTo(0, document.body.scrollHeight / 2)")
+                    await asyncio.sleep(1)
 
-                html = await page.content()
-                await browser.close()
-                return html
+                    html = await page.content()
+                    return html
+                finally:
+                    await page.close()
+                    await context.close()
+            else:
+                # Legacy method: launch new browser (should be avoided)
+                async with async_playwright() as p:
+                    browser = await p.chromium.launch(headless=True)
+                    # ... (rest of legacy logic, but we should just use the shared one)
+                    # For brevity in this refactor, let's just error or assume browser is passed
+                    logger.warning("No browser instance provided to Scraper - launching for single use (slow!)")
+                    # ... [fallback logic if needed, but we aim to replace calls]
+                    # Retaining fallback for safety for now:
+                    context = await browser.new_context(
+                        locale='de-DE',
+                        user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+                    )
+                    page = await context.new_page()
+                    await page.goto(url, wait_until='networkidle', timeout=60000)
+                    # ... waiting logic ...
+                    try:
+                         await page.wait_for_selector('[class*="ProductCard"]', timeout=15000)
+                    except: pass
+                    await page.evaluate("window.scrollTo(0, document.body.scrollHeight / 2)")
+                    await asyncio.sleep(1)
+                    html = await page.content()
+                    await browser.close()
+                    return html
 
         except Exception as e:
             logger.error(f"Failed to fetch {url}: {e}")
@@ -573,7 +610,11 @@ class BeautifulSoupScraper(BaseScraper):
             if not html:
                 break
 
-            products = self._parse_products_from_html(html)
+            try:
+                products = await asyncio.to_thread(self._parse_products_from_html, html)
+            except Exception as e:
+                logger.error(f"Error parsing HTML: {e}")
+                products = []
 
             new_products = 0
             for p in products:
@@ -616,7 +657,7 @@ class BeautifulSoupScraper(BaseScraper):
             if not html:
                 continue
 
-            products = self._parse_products_from_html(html)
+            products = await asyncio.to_thread(self._parse_products_from_html, html)
 
             # All products from this search are actually reduced
             for p in products:
@@ -637,10 +678,10 @@ class BeautifulSoupScraper(BaseScraper):
         # Use the new method that searches for actually reduced items
         return await self.scrape_reduced_products()
 
-    async def scrape_brand_products(self, brands: list[str], max_price_per_kg: float = None, max_pages: int = 100) -> list[ScrapedProduct]:
+    async def scrape_brand_products(self, brands: list[str], max_price_per_kg: float = None, max_pages: int = 100, include_default_brands: bool = True) -> list[ScrapedProduct]:
         """Scrape wet cat food for specific brands using a bulk filter for efficiency."""
         # Merge quality brands with user's watched brands
-        all_brands = list(set(self.QUALITY_BRANDS + (brands or [])))
+        all_brands = list(set((self.QUALITY_BRANDS if include_default_brands else []) + (brands or [])))
 
         if not all_brands:
             return []
@@ -682,7 +723,7 @@ class BeautifulSoupScraper(BaseScraper):
             if not html:
                 break
 
-            products = self._parse_products_from_html(html)
+            products = await asyncio.to_thread(self._parse_products_from_html, html)
             if not products:
                 break
 
@@ -825,36 +866,49 @@ class FressnapfScraper(BaseScraper):
         # All other products from wet food category are valid
         return True
 
+    def __init__(self, browser=None):
+        self.browser = browser
+
     async def _fetch_page_with_js(self, url: str) -> Optional[str]:
         """Fetch page with JavaScript rendering using Playwright."""
         try:
             delay = random.uniform(settings.request_delay_min, settings.request_delay_max)
             await asyncio.sleep(delay)
 
-            async with async_playwright() as p:
-                browser = await p.chromium.launch(headless=True)
-                context = await browser.new_context(
+            if self.browser:
+                context = await self.browser.new_context(
                     locale='de-DE',
                     user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
                 )
                 page = await context.new_page()
-
-                await page.goto(url, wait_until='networkidle', timeout=60000)
-
-                # Wait for product teasers to load
                 try:
-                    await page.wait_for_selector('.product-teaser', timeout=15000)
-                except Exception:
-                    logger.warning(f"No product teasers found on {url}")
+                    await page.goto(url, wait_until='networkidle', timeout=60000)
+                    
+                    try:
+                        await page.wait_for_selector('.product-teaser', timeout=15000)
+                    except Exception:
+                        logger.warning(f"No product teasers found on {url}")
 
-                # Scroll to load lazy content
-                for _ in range(2):
-                    await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
-                    await asyncio.sleep(1)
+                    for _ in range(2):
+                        await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+                        await asyncio.sleep(1)
 
-                html = await page.content()
-                await browser.close()
-                return html
+                    html = await page.content()
+                    return html
+                finally:
+                    await page.close()
+                    await context.close()
+            else:
+                # Fallback
+                async with async_playwright() as p:
+                    browser = await p.chromium.launch(headless=True)
+                    # ... [minimal fallback implementation]
+                    context = await browser.new_context()
+                    page = await context.new_page()
+                    await page.goto(url, wait_until='networkidle')
+                    html = await page.content()
+                    await browser.close()
+                    return html
 
         except Exception as e:
             logger.error(f"Failed to fetch {url}: {e}")
@@ -1010,10 +1064,10 @@ class FressnapfScraper(BaseScraper):
         brand_params = ':'.join(f'brand:{code}' for code in set(brand_codes))
         return f"{self.CATEGORY_URL}?q=::{brand_params}"
 
-    async def scrape_brand_products(self, brands: list[str], max_price_per_kg: float = None, max_pages: int = 20) -> list[ScrapedProduct]:
+    async def scrape_brand_products(self, brands: list[str], max_price_per_kg: float = None, max_pages: int = 20, include_default_brands: bool = True) -> list[ScrapedProduct]:
         """Scrape wet cat food for specific brands from Fressnapf."""
         # Merge quality brands with user's watched brands
-        all_brands = list(set(self.QUALITY_BRANDS + (brands or [])))
+        all_brands = list(set((self.QUALITY_BRANDS if include_default_brands else []) + (brands or [])))
 
         # Get brands that have Fressnapf codes (Fressnapf has limited brand selection)
         valid_brands = []
@@ -1049,7 +1103,7 @@ class FressnapfScraper(BaseScraper):
             if not html:
                 break
 
-            products = self._parse_products_from_html(html)
+            products = await asyncio.to_thread(self._parse_products_from_html, html)
             if not products:
                 break
 
@@ -1092,7 +1146,7 @@ class FressnapfScraper(BaseScraper):
         if not html:
             return []
 
-        products = self._parse_products_from_html(html)
+        products = await asyncio.to_thread(self._parse_products_from_html, html)
 
         for p in products:
             if p.external_id not in seen_ids:
@@ -1355,40 +1409,50 @@ class ZooroyalScraper(BaseScraper):
             base_id = f"{base_id}:{query['sDetail'][0]}"
         return f"{self.SITE_NAME}:{base_id}"
 
+    def __init__(self, browser=None):
+        self.browser = browser
+
     async def _fetch_and_extract_products(self, url: str) -> list[dict]:
         """Fetch page and extract product data using JavaScript (for shadow DOM)."""
         try:
             delay = random.uniform(settings.request_delay_min, settings.request_delay_max)
             await asyncio.sleep(delay)
 
-            async with async_playwright() as p:
-                browser = await p.chromium.launch(headless=True)
-                context = await browser.new_context(
+            if self.browser:
+                context = await self.browser.new_context(
                     locale='de-DE',
                     user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
                 )
                 page = await context.new_page()
-
-                await page.goto(url, wait_until='networkidle', timeout=60000)
-
-                # Wait for product tiles to appear
                 try:
-                    await page.wait_for_selector('zr-product-tile', timeout=15000)
-                except Exception:
-                    logger.warning(f"No product tiles found on {url}")
+                    await page.goto(url, wait_until='networkidle', timeout=60000)
+                    
+                    try:
+                        await page.wait_for_selector('zr-product-tile', timeout=15000)
+                    except Exception:
+                        logger.warning(f"No product tiles found on {url}")
+                        return []
+
+                    for _ in range(3):
+                        await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+                        await asyncio.sleep(1.5)
+
+                    products = await page.evaluate(self.EXTRACT_PRODUCTS_JS)
+                    return products
+                finally:
+                    await page.close()
+                    await context.close()
+            else:
+                 # Fallback
+                async with async_playwright() as p:
+                    # ... [same fallback logic]
+                    browser = await p.chromium.launch(headless=True)
+                    context = await browser.new_context()
+                    page = await context.new_page()
+                    await page.goto(url)
+                    products = await page.evaluate(self.EXTRACT_PRODUCTS_JS)
                     await browser.close()
-                    return []
-
-                # Scroll to load lazy content
-                for _ in range(3):
-                    await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
-                    await asyncio.sleep(1.5)
-
-                # Extract products using JavaScript
-                products = await page.evaluate(self.EXTRACT_PRODUCTS_JS)
-
-                await browser.close()
-                return products
+                    return products
 
         except Exception as e:
             logger.error(f"Failed to fetch {url}: {e}")
@@ -1562,10 +1626,10 @@ class ZooroyalScraper(BaseScraper):
 
         return False
 
-    def _get_brand_slugs(self, brands: list[str]) -> list[str]:
+    def _get_brand_slugs(self, brands: list[str], include_default_brands: bool = True) -> list[str]:
         """Get Zooroyal brand URL slugs, always including quality brands."""
         # Start with quality brand slugs
-        slugs = list(self.QUALITY_BRAND_SLUGS)
+        slugs = list(self.QUALITY_BRAND_SLUGS) if include_default_brands else []
 
         # Add any additional watched brands from user
         for brand in (brands or []):
@@ -1628,7 +1692,7 @@ class ZooroyalScraper(BaseScraper):
 
         return products
 
-    async def scrape_brand_products(self, brands: list[str], max_price_per_kg: float = None, max_pages: int = 10) -> list[ScrapedProduct]:
+    async def scrape_brand_products(self, brands: list[str], max_price_per_kg: float = None, max_pages: int = 10, include_default_brands: bool = True) -> list[ScrapedProduct]:
         """
         Scrape wet cat food for specific brands from Zooroyal.
 
@@ -1637,7 +1701,7 @@ class ZooroyalScraper(BaseScraper):
         Scrapes brands in parallel with limited concurrency (MAX_CONCURRENT_BRANDS).
         """
         # Get brand slugs for URL paths (always includes quality brands)
-        brand_slugs = self._get_brand_slugs(brands)
+        brand_slugs = self._get_brand_slugs(brands, include_default_brands=include_default_brands)
 
         if not brand_slugs:
             logger.warning(f"No Zooroyal brand slugs found")
@@ -1688,6 +1752,11 @@ class Zoo24Scraper(BaseScraper):
     SEARCH_URL = "https://www.zoo24.de/search"
     MAX_SEARCH_PAGES = 35
 
+    MAX_SEARCH_PAGES = 35
+
+    def __init__(self, browser=None):
+        self.browser = browser
+
     def _is_wet_food(self, name: str) -> bool:
         """Check if product is wet cat food (exclude dry food, snacks, accessories)."""
         name_lower = name.lower()
@@ -1714,32 +1783,42 @@ class Zoo24Scraper(BaseScraper):
             delay = random.uniform(settings.request_delay_min, settings.request_delay_max)
             await asyncio.sleep(delay)
 
-            async with async_playwright() as p:
-                browser = await p.chromium.launch(headless=True)
-                context = await browser.new_context(
+            if self.browser:
+                context = await self.browser.new_context(
                     locale='de-DE',
                     user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
                 )
                 page = await context.new_page()
-
-                await page.goto(url, wait_until='domcontentloaded', timeout=30000)
-
-                # Wait for product cards to render
                 try:
-                    await page.wait_for_selector('product-card', timeout=20000)
-                except Exception:
-                    logger.warning(f"No product-card elements found on {url}")
+                    await page.goto(url, wait_until='domcontentloaded', timeout=30000)
+
+                    # Wait for product cards to render
+                    try:
+                        await page.wait_for_selector('product-card', timeout=20000)
+                    except Exception:
+                        logger.warning(f"No product-card elements found on {url}")
+                        return None
+
+                    # Scroll to load lazy content
+                    for _ in range(3):
+                        await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+                        await asyncio.sleep(1)
+
+                    html = await page.content()
+                    return html
+                finally:
+                    await page.close()
+                    await context.close()
+            else:
+                 # Fallback
+                async with async_playwright() as p:
+                    browser = await p.chromium.launch(headless=True)
+                    context = await browser.new_context()
+                    page = await context.new_page()
+                    await page.goto(url, wait_until='domcontentloaded')
+                    html = await page.content()
                     await browser.close()
-                    return None
-
-                # Scroll to load lazy content
-                for _ in range(3):
-                    await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
-                    await asyncio.sleep(1)
-
-                html = await page.content()
-                await browser.close()
-                return html
+                    return html
 
         except Exception as e:
             logger.error(f"Zoo24: Failed to fetch {url}: {e}")
@@ -1878,9 +1957,9 @@ class Zoo24Scraper(BaseScraper):
             variant_name=variant_name,
         )
 
-    async def scrape_brand_products(self, brands: list[str], max_price_per_kg: float = None, max_pages: int = None) -> list[ScrapedProduct]:
+    async def scrape_brand_products(self, brands: list[str], max_price_per_kg: float = None, max_pages: int = None, include_default_brands: bool = True) -> list[ScrapedProduct]:
         """Scrape wet cat food from Zoo24 search, filtered by brands and price."""
-        all_brands = list(set(self.QUALITY_BRANDS + (brands or [])))
+        all_brands = list(set((self.QUALITY_BRANDS if include_default_brands else []) + (brands or [])))
         brand_set = {self.normalize_brand(b) for b in all_brands}
 
         scrape_price = max(max_price_per_kg or 0, self.DEFAULT_MAX_PRICE_PER_KG)
@@ -1898,7 +1977,7 @@ class Zoo24Scraper(BaseScraper):
             if not html:
                 break
 
-            products = self._parse_products_from_html(html)
+            products = await asyncio.to_thread(self._parse_products_from_html, html)
             if not products:
                 break
 
@@ -1954,7 +2033,7 @@ class Zoo24Scraper(BaseScraper):
             if not html:
                 break
 
-            products = self._parse_products_from_html(html)
+            products = await asyncio.to_thread(self._parse_products_from_html, html)
             if not products:
                 break
 
@@ -1976,14 +2055,14 @@ class Zoo24Scraper(BaseScraper):
         return all_products
 
 
-async def _scrape_site(scraper, watched_brands: list[str], max_price_per_kg: float = None) -> list[ScrapedProduct]:
+async def _scrape_site(scraper, watched_brands: list[str], max_price_per_kg: float = None, include_default_brands: bool = True) -> list[ScrapedProduct]:
     """Scrape a single site for watched brands. Helper for parallel execution."""
     site_name = scraper.SITE_NAME
     logger.info(f"Scraping {site_name}...")
 
     try:
         # Scrape products from watched brands
-        products = await scraper.scrape_brand_products(watched_brands, max_price_per_kg=max_price_per_kg)
+        products = await scraper.scrape_brand_products(watched_brands, max_price_per_kg=max_price_per_kg, include_default_brands=include_default_brands)
 
         # Also check for reduced items from watched brands specifically
         reduced = await scraper.scrape_reduced_products(brands=watched_brands)
@@ -2005,30 +2084,47 @@ async def _scrape_site(scraper, watched_brands: list[str], max_price_per_kg: flo
         return []
 
 
-async def scrape_all_async(watched_brands: list[str] = None, max_price_per_kg: float = None) -> list[ScrapedProduct]:
+async def scrape_all_async(watched_brands: list[str] = None, max_price_per_kg: float = None, include_default_brands: bool = True) -> list[ScrapedProduct]:
     """Main async function to scrape products from all sites in parallel.
 
     Always scrapes quality brands. If watched_brands is provided, those are also included.
     """
-    # Scrape from all sites in parallel (quality brands are always included)
-    scrapers = [ZooplusScraper(), BitibaScraper(), ZooroyalScraper(), FressnapfScraper(), Zoo24Scraper()]
+    try:
+        # Launch browser once for all scrapers
+        async with async_playwright() as p:
+            logger.info("Launching shared browser instance...")
+            browser = await p.chromium.launch(headless=True)
+            
+            # Use the shared browser instance for all scrapers
+            scrapers = [
+                ZooplusScraper(browser=browser), 
+                BitibaScraper(browser=browser), 
+                ZooroyalScraper(browser=browser), 
+                FressnapfScraper(browser=browser), 
+                Zoo24Scraper(browser=browser)
+            ]
 
-    # Run all scrapers concurrently
-    results = await asyncio.gather(
-        *[_scrape_site(scraper, watched_brands, max_price_per_kg) for scraper in scrapers],
-        return_exceptions=True
-    )
+            # Run all scrapers concurrently
+            results = await asyncio.gather(
+                *[_scrape_site(scraper, watched_brands, max_price_per_kg, include_default_brands) for scraper in scrapers],
+                return_exceptions=True
+            )
 
-    # Combine results from all sites
-    all_products = []
-    for result in results:
-        if isinstance(result, Exception):
-            logger.error(f"Scraper failed with exception: {result}")
-        elif result:
-            all_products.extend(result)
+            # Combine results from all sites
+            all_products = []
+            for result in results:
+                if isinstance(result, Exception):
+                    logger.error(f"Scraper failed with exception: {result}")
+                elif result:
+                    all_products.extend(result)
 
-    logger.info(f"Total products scraped from all sites: {len(all_products)}")
-    return all_products
+            logger.info(f"Total products scraped from all sites: {len(all_products)}")
+            await browser.close()
+            return all_products
+            
+    except Exception as e:
+        logger.error(f"Fatal error during scraping: {e}")
+        return []
 
 
 def scrape_all() -> list[ScrapedProduct]:

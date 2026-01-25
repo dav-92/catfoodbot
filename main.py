@@ -15,7 +15,7 @@ from apscheduler.triggers.interval import IntervalTrigger
 from config import settings
 from database import init_db
 from tracker import run_check
-from notifier import create_bot_application, send_test_message
+from bot.application import create_bot_application, send_test_message
 
 logging.basicConfig(
     level=logging.INFO,

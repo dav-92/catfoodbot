@@ -1,7 +1,7 @@
 import re
 from datetime import datetime
 from sqlalchemy import create_engine, Column, Integer, String, Float, DateTime, Boolean, ForeignKey
-from sqlalchemy.orm import declarative_base, sessionmaker, relationship
+from sqlalchemy.orm import declarative_base, sessionmaker, relationship, joinedload
 
 from config import settings
 
@@ -117,6 +117,19 @@ class AlertSent(Base):
     sent_at = Column(DateTime, default=datetime.utcnow)
 
 
+class WatchedBrand(Base):
+    """Normalize watched brands into a separate table."""
+    __tablename__ = "watched_brands"
+
+    id = Column(Integer, primary_key=True)
+    user_pref_id = Column(Integer, ForeignKey("user_preferences.id"), nullable=False)
+    brand_name = Column(String, nullable=False, index=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+    user_prefs = relationship("UserPreferences", back_populates="brands")
+
+
+
 class UserPreferences(Base):
     """Store user preferences for brand filtering."""
     __tablename__ = "user_preferences"
@@ -130,33 +143,59 @@ class UserPreferences(Base):
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
+    # One-to-many relationship
+    brands = relationship("WatchedBrand", back_populates="user_prefs", cascade="all, delete-orphan", lazy="joined")
+
     def get_brands_list(self) -> list[str]:
         """Get watched brands as a list."""
+        # Prefer new relational data
+        if self.brands:
+            return [b.brand_name for b in self.brands]
+            
+        # Fallback to legacy field until migrated
         if not self.watched_brands:
             return []
         return [b.strip() for b in self.watched_brands.split(",") if b.strip()]
 
     def set_brands_list(self, brands: list[str]):
-        """Set watched brands from a list."""
+        """Legacy setter - do not use for new code. Use add_brand/remove_brand."""
+        # This keeps the legacy field in sync for now, but really we should use the relationship
         self.watched_brands = ",".join(brands)
 
     def add_brand(self, brand: str) -> bool:
         """Add a brand to watch list. Returns True if added, False if already exists."""
-        brands = self.get_brands_list()
+        current_brands = self.get_brands_list()
         brand_lower = brand.lower()
-        if any(b.lower() == brand_lower for b in brands):
+        if any(b.lower() == brand_lower for b in current_brands):
             return False
-        brands.append(brand)
-        self.set_brands_list(brands)
+            
+        # Add to relationship
+        new_brand = WatchedBrand(brand_name=brand)
+        self.brands.append(new_brand)
+        
+        # Keep legacy field in sync for now
+        current_brands.append(brand)
+        self.set_brands_list(current_brands)
         return True
 
     def remove_brand(self, brand: str) -> bool:
         """Remove a brand from watch list. Returns True if removed."""
-        brands = self.get_brands_list()
+        # Remove from relationship
+        found = False
+        if self.brands:
+            for b in list(self.brands):
+                if b.brand_name.lower() == brand.lower():
+                    self.brands.remove(b)
+                    found = True
+        
+        # Update legacy field logic
+        current_brands = self.get_brands_list() # This might use legacy or new depending on data
         brand_lower = brand.lower()
-        new_brands = [b for b in brands if b.lower() != brand_lower]
-        if len(new_brands) == len(brands):
+        new_brands = [b for b in current_brands if b.lower() != brand_lower]
+        
+        if len(new_brands) == len(current_brands) and not found:
             return False
+            
         self.set_brands_list(new_brands)
         return True
 
@@ -196,11 +235,13 @@ def get_session():
     return SessionLocal()
 
 
+
+
 def get_or_create_preferences(chat_id: str) -> UserPreferences:
     """Get or create user preferences for a chat ID."""
     session = get_session()
     try:
-        prefs = session.query(UserPreferences).filter(
+        prefs = session.query(UserPreferences).options(joinedload(UserPreferences.brands)).filter(
             UserPreferences.chat_id == chat_id
         ).first()
 
@@ -208,7 +249,10 @@ def get_or_create_preferences(chat_id: str) -> UserPreferences:
             prefs = UserPreferences(chat_id=chat_id)
             session.add(prefs)
             session.commit()
-            session.refresh(prefs)
+            # Re-query with eager load to ensure brands are loaded
+            prefs = session.query(UserPreferences).options(joinedload(UserPreferences.brands)).filter(
+                UserPreferences.chat_id == chat_id
+            ).first()
 
         return prefs
     finally:
