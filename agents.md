@@ -27,7 +27,7 @@ docker-compose up --build -d
 - **Remove Brand**: `/removebrands macs`
 
 ## Maintenance
-- **Database Cleanup**: Runs automatically daily at 04:00 to delete `PriceHistory` records older than 7 days.
+- **Database Cleanup**: Runs automatically every 24 hours (first run 10 minutes after startup) to delete `PriceHistory` records older than 7 days.
 - **Migration**: Run `python migrate_brands.py` inside the container if upgrading from v1.
 
 ## Architecture Notes
