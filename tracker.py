@@ -296,46 +296,69 @@ async def run_check():
         # Initialize database
         init_db()
 
-        # Get all watched brands and lowest max price from all users
-        session = get_session()
-        try:
-            from database import UserPreferences
-            all_users = session.query(UserPreferences).filter(
-                UserPreferences.alerts_enabled == True
-            ).all()
+        # Fixed scraping parameters: All brands, up to 10€/kg
+        # This decouples scraping from user settings
+        logger.info("Scraping ALL brands up to 10.00€/kg")
 
-            # Collect all unique watched brands from all users
-            watched_brands = set()
-            price_ceiling = None  # Track highest max_price (to include products for all users)
-            for user in all_users:
-                watched_brands.update(user.get_brands_list())
-                if user.max_price_per_kg is not None:
-                    if price_ceiling is None or user.max_price_per_kg > price_ceiling:
-                        price_ceiling = user.max_price_per_kg
+        # Accumulate stats across chunks
+        total_stats = {
+            "total": 0,
+            "new_products": 0,
+            "on_sale": 0,
+            "alerts_sent": 0
+        }
 
-            logger.info(f"Scraping for {len(all_users)} users, {len(watched_brands)} brands")
-        finally:
-            session.close()
+        async def handle_chunk(products: list[ScrapedProduct]):
+            """Process a chunk of products immediately."""
+            if not products:
+                return
+            
+            chunk_stats = await process_products(products)
+            
+            # Update total stats
+            total_stats["total"] += chunk_stats["total"]
+            total_stats["new_products"] += chunk_stats["new_products"]
+            total_stats["on_sale"] += chunk_stats["on_sale"]
+            total_stats["alerts_sent"] += chunk_stats["alerts_sent"]
+            
+            logger.info(f"Processed chunk: {chunk_stats['total']} products, {chunk_stats['alerts_sent']} new alerts")
 
-        # Scrape products (including watched brands specifically, filtered by max price)
-        products = await scrape_all_async(watched_brands=list(watched_brands), max_price_per_kg=price_ceiling)
-
-        if not products:
-            logger.warning("No products scraped!")
-            return
-
-        # Process and send alerts
-        stats = await process_products(products)
-
-        logger.info(
-            f"Check complete: {stats['total']} products, "
-            f"{stats['new_products']} new, {stats['on_sale']} on sale, "
-            f"{stats['alerts_sent']} alerts sent"
+        # Scrape products with streaming callback
+        await scrape_all_async(
+            watched_brands=None,  # None = scrape all quality brands
+            max_price_per_kg=10.0,
+            on_chunk_callback=handle_chunk
         )
 
-        return stats
+        logger.info(
+            f"Check complete: {total_stats['total']} products, "
+            f"{total_stats['new_products']} new, {total_stats['on_sale']} on sale, "
+            f"{total_stats['alerts_sent']} alerts sent"
+        )
+
+        return total_stats
     finally:
         _is_running = False
+
+
+def cleanup_old_offers(days_retention: int = 7) -> int:
+    """Delete PriceHistory records older than N days."""
+    session = get_session()
+    try:
+        cutoff = datetime.utcnow() - timedelta(days=days_retention)
+        deleted_count = session.query(PriceHistory).filter(
+            PriceHistory.recorded_at < cutoff
+        ).delete()
+        session.commit()
+        if deleted_count > 0:
+            logger.info(f"Cleanup: Deleted {deleted_count} old price records (< {cutoff.date()})")
+        return deleted_count
+    except Exception as e:
+        logger.error(f"Cleanup failed: {e}")
+        session.rollback()
+        return 0
+    finally:
+        session.close()
 
 
 

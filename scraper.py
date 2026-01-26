@@ -10,6 +10,8 @@ from urllib.parse import urljoin, urlparse, parse_qs, quote
 
 from playwright.async_api import async_playwright
 from bs4 import BeautifulSoup
+from typing import AsyncGenerator, Callable
+
 
 from config import settings
 
@@ -108,14 +110,14 @@ class BaseScraper(ABC):
         pass
 
     @abstractmethod
-    async def scrape_brand_products(self, brands: list[str], max_price_per_kg: float = None, max_pages: int = 100, include_default_brands: bool = True) -> list[ScrapedProduct]:
+    async def scrape_brand_products(self, brands: list[str], max_price_per_kg: float = None, max_pages: int = 100, include_default_brands: bool = True) -> AsyncGenerator[list[ScrapedProduct], None]:
         """Scrape products for specific brands."""
-        pass
+        yield []
 
     @abstractmethod
-    async def scrape_reduced_products(self, brands: list[str] = None) -> list[ScrapedProduct]:
+    async def scrape_reduced_products(self, brands: list[str] = None) -> AsyncGenerator[list[ScrapedProduct], None]:
         """Scrape reduced/sale products."""
-        pass
+        yield []
 
     def _parse_price(self, price_str: str) -> Optional[float]:
         """Parse German price format (e.g., '12,99 €' -> 12.99)."""
@@ -597,9 +599,8 @@ class BeautifulSoupScraper(BaseScraper):
             variant_name=variant_name
         )
 
-    async def scrape_category(self, max_pages: int = 3) -> list[ScrapedProduct]:
+    async def scrape_category(self, max_pages: int = 3) -> AsyncGenerator[list[ScrapedProduct], None]:
         """Scrape wet cat food category pages."""
-        all_products = []
         seen_ids = set()
 
         for page_num in range(1, max_pages + 1):
@@ -616,24 +617,24 @@ class BeautifulSoupScraper(BaseScraper):
                 logger.error(f"Error parsing HTML: {e}")
                 products = []
 
+            chunk = []
             new_products = 0
             for p in products:
                 if p.external_id not in seen_ids:
                     seen_ids.add(p.external_id)
-                    all_products.append(p)
+                    chunk.append(p)
                     new_products += 1
+
+            if chunk:
+                yield chunk
 
             logger.info(f"Page {page_num}: {new_products} new products")
 
             if new_products == 0:
                 break
 
-        logger.info(f"Total products scraped: {len(all_products)}")
-        return all_products
-
-    async def scrape_reduced_products(self, brands: list[str] = None) -> list[ScrapedProduct]:
+    async def scrape_reduced_products(self, brands: list[str] = None) -> AsyncGenerator[list[ScrapedProduct], None]:
         """Scrape actually reduced wet cat food using search with Reduziert filter."""
-        all_products = []
         seen_ids = set()
 
         # If no brands specified, scrape all reduced wet cat food
@@ -658,35 +659,36 @@ class BeautifulSoupScraper(BaseScraper):
                 continue
 
             products = await asyncio.to_thread(self._parse_products_from_html, html)
-
+            
+            chunk = []
             # All products from this search are actually reduced
             for p in products:
                 if p.external_id not in seen_ids:
                     p.is_on_sale = True  # These are confirmed reduced
                     seen_ids.add(p.external_id)
-                    all_products.append(p)
+                    chunk.append(p)
+            
+            if chunk:
+                yield chunk
 
             # Small delay between brand searches
             if brand:
                 await asyncio.sleep(1)
 
-        logger.info(f"Found {len(all_products)} reduced products total")
-        return all_products
-
-    async def scrape_deals_page(self) -> list[ScrapedProduct]:
+    async def scrape_deals_page(self) -> AsyncGenerator[list[ScrapedProduct], None]:
         """Scrape the deals/sale page - now uses search with Reduziert filter."""
         # Use the new method that searches for actually reduced items
-        return await self.scrape_reduced_products()
+        async for chunk in self.scrape_reduced_products():
+            yield chunk
 
-    async def scrape_brand_products(self, brands: list[str], max_price_per_kg: float = None, max_pages: int = 100, include_default_brands: bool = True) -> list[ScrapedProduct]:
+    async def scrape_brand_products(self, brands: list[str], max_price_per_kg: float = None, max_pages: int = 100, include_default_brands: bool = True) -> AsyncGenerator[list[ScrapedProduct], None]:
         """Scrape wet cat food for specific brands using a bulk filter for efficiency."""
         # Merge quality brands with user's watched brands
         all_brands = list(set((self.QUALITY_BRANDS if include_default_brands else []) + (brands or [])))
 
         if not all_brands:
-            return []
+            return
 
-        all_products = []
         seen_ids = set()
 
         # Build bulk brand filter: brand=brand1;brand2;brand3
@@ -727,17 +729,19 @@ class BeautifulSoupScraper(BaseScraper):
             if not products:
                 break
 
+            chunk = []
             new_count = 0
             for p in products:
                 if p.external_id not in seen_ids:
                     seen_ids.add(p.external_id)
-                    all_products.append(p)
+                    chunk.append(p)
                     new_count += 1
+            
+            if chunk:
+                yield chunk
 
             if new_count == 0:
                 break
-
-        return all_products
 
 
 class ZooplusScraper(BeautifulSoupScraper):
@@ -1064,7 +1068,7 @@ class FressnapfScraper(BaseScraper):
         brand_params = ':'.join(f'brand:{code}' for code in set(brand_codes))
         return f"{self.CATEGORY_URL}?q=::{brand_params}"
 
-    async def scrape_brand_products(self, brands: list[str], max_price_per_kg: float = None, max_pages: int = 20, include_default_brands: bool = True) -> list[ScrapedProduct]:
+    async def scrape_brand_products(self, brands: list[str], max_price_per_kg: float = None, max_pages: int = 20, include_default_brands: bool = True) -> AsyncGenerator[list[ScrapedProduct], None]:
         """Scrape wet cat food for specific brands from Fressnapf."""
         # Merge quality brands with user's watched brands
         all_brands = list(set((self.QUALITY_BRANDS if include_default_brands else []) + (brands or [])))
@@ -1084,11 +1088,10 @@ class FressnapfScraper(BaseScraper):
 
         if not valid_brands:
             logger.warning("No valid Fressnapf brand codes found")
-            return []
+            return
 
         logger.info(f"Scraping Fressnapf for {len(valid_brands)} brands (of {len(all_brands)} requested)")
 
-        all_products = []
         seen_ids = set()
 
         # Build URL with all brand filters
@@ -1107,6 +1110,7 @@ class FressnapfScraper(BaseScraper):
             if not products:
                 break
 
+            chunk = []
             new_count = 0
             for p in products:
                 # Apply price filter
@@ -1117,18 +1121,17 @@ class FressnapfScraper(BaseScraper):
 
                 if p.external_id not in seen_ids:
                     seen_ids.add(p.external_id)
-                    all_products.append(p)
+                    chunk.append(p)
                     new_count += 1
+            
+            if chunk:
+                yield chunk
 
             if new_count == 0 and page_num > 1:
                 break
 
-        logger.info(f"Fressnapf found {len(all_products)} products")
-        return all_products
-
-    async def scrape_reduced_products(self, brands: list[str] = None) -> list[ScrapedProduct]:
+    async def scrape_reduced_products(self, brands: list[str] = None) -> AsyncGenerator[list[ScrapedProduct], None]:
         """Scrape reduced/sale products from Fressnapf."""
-        all_products = []
         seen_ids = set()
 
         # Use sale filter: aktionen=angebote
@@ -1144,9 +1147,11 @@ class FressnapfScraper(BaseScraper):
 
         html = await self._fetch_page_with_js(base_url)
         if not html:
-            return []
+            return
 
         products = await asyncio.to_thread(self._parse_products_from_html, html)
+        
+        chunk = []
 
         for p in products:
             if p.external_id not in seen_ids:
@@ -1154,10 +1159,10 @@ class FressnapfScraper(BaseScraper):
                 if not p.is_on_sale:
                     p.is_on_sale = True
                 seen_ids.add(p.external_id)
-                all_products.append(p)
-
-        logger.info(f"Fressnapf found {len(all_products)} reduced products")
-        return all_products
+                chunk.append(p)
+        
+        if chunk:
+            yield chunk
 
 
 class ZooroyalScraper(BaseScraper):
@@ -1538,9 +1543,8 @@ class ZooroyalScraper(BaseScraper):
             variant_name=variant_name
         )
 
-    async def scrape_category(self, max_pages: int = 3) -> list[ScrapedProduct]:
+    async def scrape_category(self, max_pages: int = 3) -> AsyncGenerator[list[ScrapedProduct], None]:
         """Scrape wet cat food category pages from Zooroyal."""
-        all_products = []
         seen_ids = set()
 
         for page_num in range(1, max_pages + 1):
@@ -1549,25 +1553,25 @@ class ZooroyalScraper(BaseScraper):
 
             raw_products = await self._fetch_and_extract_products(url)
 
+            chunk = []
             new_products = 0
             for data in raw_products:
                 product = self._convert_to_scraped_product(data)
                 if product and product.external_id not in seen_ids:
                     seen_ids.add(product.external_id)
-                    all_products.append(product)
+                    chunk.append(product)
                     new_products += 1
+
+            if chunk:
+                yield chunk
 
             logger.info(f"Zooroyal page {page_num}: {new_products} new products")
 
             if new_products == 0:
                 break
 
-        logger.info(f"Zooroyal total products scraped: {len(all_products)}")
-        return all_products
-
-    async def scrape_reduced_products(self, brands: list[str] = None) -> list[ScrapedProduct]:
+    async def scrape_reduced_products(self, brands: list[str] = None) -> AsyncGenerator[list[ScrapedProduct], None]:
         """Scrape reduced/sale products from Zooroyal."""
-        all_products = []
         seen_ids = set()
 
         # Zooroyal search doesn't reliably filter by brand, so we scrape
@@ -1577,6 +1581,7 @@ class ZooroyalScraper(BaseScraper):
 
         raw_products = await self._fetch_and_extract_products(url)
 
+        chunk = []
         for data in raw_products:
             product = self._convert_to_scraped_product(data)
             if not product or product.external_id in seen_ids:
@@ -1591,10 +1596,12 @@ class ZooroyalScraper(BaseScraper):
                 continue
 
             seen_ids.add(product.external_id)
-            all_products.append(product)
+            chunk.append(product)
 
-        logger.info(f"Zooroyal found {len(all_products)} reduced products")
-        return all_products
+        if chunk:
+            yield chunk
+
+        logger.info(f"Zooroyal found {len(chunk)} reduced products")
 
     def _matches_brand(self, product_brand: str, watched_brands: list[str]) -> bool:
         """
@@ -1645,20 +1652,11 @@ class ZooroyalScraper(BaseScraper):
                         break
         return list(set(slugs))  # Remove duplicates
 
-    async def _scrape_single_brand(self, slug: str, max_price_per_kg: float, max_pages: int, semaphore: asyncio.Semaphore) -> list[ScrapedProduct]:
+    async def _scrape_single_brand(self, slug: str, max_price_per_kg: float, max_pages: int, semaphore: asyncio.Semaphore) -> AsyncGenerator[list[ScrapedProduct], None]:
         """
         Scrape a single brand from Zooroyal (used for parallel execution).
-
-        Args:
-            slug: Brand URL slug (e.g., 'leonardo', 'macs')
-            max_price_per_kg: Maximum price per kg filter
-            max_pages: Maximum pages to scrape per brand
-            semaphore: Semaphore to limit concurrent requests
-
-        Returns:
-            List of scraped products for this brand
+        Yields chunks of products.
         """
-        products = []
         brand_url = f"{self.CATEGORY_URL}{slug}"
 
         async with semaphore:
@@ -1672,6 +1670,7 @@ class ZooroyalScraper(BaseScraper):
                 if not raw_products:
                     break
 
+                chunk = []
                 new_count = 0
                 for data in raw_products:
                     product = self._convert_to_scraped_product(data)
@@ -1684,57 +1683,63 @@ class ZooroyalScraper(BaseScraper):
                     if price_per_kg and price_per_kg > scrape_price * 1.3:  # 30% headroom
                         continue
 
-                    products.append(product)
+                    chunk.append(product)
                     new_count += 1
+                
+                if chunk:
+                    yield chunk
 
                 if new_count == 0 and page_num > 1:
                     break
 
-        return products
-
-    async def scrape_brand_products(self, brands: list[str], max_price_per_kg: float = None, max_pages: int = 10, include_default_brands: bool = True) -> list[ScrapedProduct]:
+    async def scrape_brand_products(self, brands: list[str], max_price_per_kg: float = None, max_pages: int = 10, include_default_brands: bool = True) -> AsyncGenerator[list[ScrapedProduct], None]:
         """
         Scrape wet cat food for specific brands from Zooroyal.
-
-        Uses path-based brand filtering: /katzen-nassfutter/{brand-slug}
-        Always includes quality brands plus any user-specified watched brands.
-        Scrapes brands in parallel with limited concurrency (MAX_CONCURRENT_BRANDS).
+        Yields chunks of products from all parallel brand scrapes.
         """
-        # Get brand slugs for URL paths (always includes quality brands)
+        # Get brand slugs
         brand_slugs = self._get_brand_slugs(brands, include_default_brands=include_default_brands)
 
         if not brand_slugs:
             logger.warning(f"No Zooroyal brand slugs found")
-            return []
+            return
 
         logger.info(f"Scraping Zooroyal for {len(brand_slugs)} brands ({self.MAX_CONCURRENT_BRANDS} concurrent)")
 
-        # Create semaphore to limit concurrent brand scrapes
         semaphore = asyncio.Semaphore(self.MAX_CONCURRENT_BRANDS)
+        queue = asyncio.Queue()
+        
+        # Producer function to drive a single brand scrape and push chunks to queue
+        async def producer(slug):
+            try:
+                async for chunk in self._scrape_single_brand(slug, max_price_per_kg, max_pages, semaphore):
+                    await queue.put(chunk)
+            except Exception as e:
+                logger.error(f"Error scraping Zooroyal brand {slug}: {e}")
+            finally:
+                await queue.put(None) # Signal completion for this producer
 
-        # Scrape all brands in parallel (limited by semaphore)
-        tasks = [
-            self._scrape_single_brand(slug, max_price_per_kg, max_pages, semaphore)
-            for slug in brand_slugs
-        ]
-
-        results = await asyncio.gather(*tasks, return_exceptions=True)
-
-        # Combine results, deduplicating by external_id
+        # Start producers
+        active_producers = 0
+        for slug in brand_slugs:
+            asyncio.create_task(producer(slug))
+            active_producers += 1
+            
+        # Consume from queue
         seen_ids = set()
-        all_products = []
-
-        for result in results:
-            if isinstance(result, Exception):
-                logger.error(f"Brand scrape failed: {result}")
-                continue
-            for product in result:
-                if product.external_id not in seen_ids:
-                    seen_ids.add(product.external_id)
-                    all_products.append(product)
-
-        logger.info(f"Zooroyal found {len(all_products)} products for {len(brand_slugs)} brands")
-        return all_products
+        while active_producers > 0:
+            item = await queue.get()
+            if item is None:
+                active_producers -= 1
+            else:
+                # Deduplicate yielded items against this session
+                chunk = []
+                for p in item:
+                    if p.external_id not in seen_ids:
+                        seen_ids.add(p.external_id)
+                        chunk.append(p)
+                if chunk:
+                    yield chunk
 
 
 class Zoo24Scraper(BaseScraper):
@@ -1957,7 +1962,7 @@ class Zoo24Scraper(BaseScraper):
             variant_name=variant_name,
         )
 
-    async def scrape_brand_products(self, brands: list[str], max_price_per_kg: float = None, max_pages: int = None, include_default_brands: bool = True) -> list[ScrapedProduct]:
+    async def scrape_brand_products(self, brands: list[str], max_price_per_kg: float = None, max_pages: int = None, include_default_brands: bool = True) -> AsyncGenerator[list[ScrapedProduct], None]:
         """Scrape wet cat food from Zoo24 search, filtered by brands and price."""
         all_brands = list(set((self.QUALITY_BRANDS if include_default_brands else []) + (brands or [])))
         brand_set = {self.normalize_brand(b) for b in all_brands}
@@ -1965,7 +1970,6 @@ class Zoo24Scraper(BaseScraper):
         scrape_price = max(max_price_per_kg or 0, self.DEFAULT_MAX_PRICE_PER_KG)
         pages_limit = max_pages or self.MAX_SEARCH_PAGES
 
-        all_products = []
         seen_ids = set()
         exceeded_price_count = 0
 
@@ -1981,6 +1985,7 @@ class Zoo24Scraper(BaseScraper):
             if not products:
                 break
 
+            chunk = []
             page_has_valid = False
             for p in products:
                 # Filter by brand
@@ -1999,29 +2004,29 @@ class Zoo24Scraper(BaseScraper):
                     exceeded_price_count += 1
                     if exceeded_price_count >= 10:
                         logger.info(f"Zoo24: Price threshold exceeded consistently, stopping at page {page_num}")
-                        return all_products
+                        if chunk: yield chunk
+                        return 
                     continue
                 else:
                     exceeded_price_count = 0
 
                 if p.external_id not in seen_ids:
                     seen_ids.add(p.external_id)
-                    all_products.append(p)
+                    chunk.append(p)
                     page_has_valid = True
+            
+            if chunk:
+                yield chunk
 
             if not page_has_valid and page_num > 3:
                 # No matching products on this page and past initial pages
                 break
 
-        logger.info(f"Zoo24: Found {len(all_products)} products")
-        return all_products
-
-    async def scrape_reduced_products(self, brands: list[str] = None) -> list[ScrapedProduct]:
+    async def scrape_reduced_products(self, brands: list[str] = None) -> AsyncGenerator[list[ScrapedProduct], None]:
         """Scrape reduced/sale products from Zoo24 search."""
         all_brands = list(set(self.QUALITY_BRANDS + (brands or [])))
         brand_set = {self.normalize_brand(b) for b in all_brands}
 
-        all_products = []
         seen_ids = set()
 
         # Scrape first few pages looking for sale items
@@ -2037,6 +2042,7 @@ class Zoo24Scraper(BaseScraper):
             if not products:
                 break
 
+            chunk = []
             for p in products:
                 if not p.is_on_sale:
                     continue
@@ -2049,45 +2055,37 @@ class Zoo24Scraper(BaseScraper):
 
                 if p.external_id not in seen_ids:
                     seen_ids.add(p.external_id)
-                    all_products.append(p)
+                    chunk.append(p)
+            
+            if chunk:
+                yield chunk
 
-        logger.info(f"Zoo24: Found {len(all_products)} reduced products")
-        return all_products
 
-
-async def _scrape_site(scraper, watched_brands: list[str], max_price_per_kg: float = None, include_default_brands: bool = True) -> list[ScrapedProduct]:
-    """Scrape a single site for watched brands. Helper for parallel execution."""
+async def _scrape_site(scraper, watched_brands: list[str], max_price_per_kg: float = None, include_default_brands: bool = True, callback: Callable[[list[ScrapedProduct]], None] = None) -> None:
+    """Scrape a single site and report chunks via callback."""
     site_name = scraper.SITE_NAME
     logger.info(f"Scraping {site_name}...")
 
     try:
         # Scrape products from watched brands
-        products = await scraper.scrape_brand_products(watched_brands, max_price_per_kg=max_price_per_kg, include_default_brands=include_default_brands)
+        async for chunk in scraper.scrape_brand_products(watched_brands, max_price_per_kg=max_price_per_kg, include_default_brands=include_default_brands):
+            if callback and chunk:
+                await callback(chunk)
 
-        # Also check for reduced items from watched brands specifically
-        reduced = await scraper.scrape_reduced_products(brands=watched_brands)
+        # Also check for reduced items
+        async for chunk in scraper.scrape_reduced_products(brands=watched_brands):
+             if callback and chunk:
+                await callback(chunk)
 
-        # Combine for this site, preferring reduced version if duplicate
-        seen_ids = {}
-        for p in reduced:
-            seen_ids[p.external_id] = p
-        for p in products:
-            if p.external_id not in seen_ids:
-                seen_ids[p.external_id] = p
-
-        site_products = list(seen_ids.values())
-        logger.info(f"Found {len(site_products)} products from {site_name}")
-        return site_products
+        logger.info(f"Finished scraping {site_name}")
 
     except Exception as e:
         logger.error(f"Error scraping {site_name}: {e}")
-        return []
 
 
-async def scrape_all_async(watched_brands: list[str] = None, max_price_per_kg: float = None, include_default_brands: bool = True) -> list[ScrapedProduct]:
+async def scrape_all_async(watched_brands: list[str] = None, max_price_per_kg: float = None, include_default_brands: bool = True, on_chunk_callback: Callable[[list[ScrapedProduct]], None] = None) -> None:
     """Main async function to scrape products from all sites in parallel.
-
-    Always scrapes quality brands. If watched_brands is provided, those are also included.
+    Products are reported via on_chunk_callback as they are found.
     """
     try:
         # Launch browser once for all scrapers
@@ -2105,31 +2103,26 @@ async def scrape_all_async(watched_brands: list[str] = None, max_price_per_kg: f
             ]
 
             # Run all scrapers concurrently
-            results = await asyncio.gather(
-                *[_scrape_site(scraper, watched_brands, max_price_per_kg, include_default_brands) for scraper in scrapers],
+            await asyncio.gather(
+                *[_scrape_site(scraper, watched_brands, max_price_per_kg, include_default_brands, on_chunk_callback) for scraper in scrapers],
                 return_exceptions=True
             )
 
-            # Combine results from all sites
-            all_products = []
-            for result in results:
-                if isinstance(result, Exception):
-                    logger.error(f"Scraper failed with exception: {result}")
-                elif result:
-                    all_products.extend(result)
-
-            logger.info(f"Total products scraped from all sites: {len(all_products)}")
             await browser.close()
-            return all_products
             
     except Exception as e:
         logger.error(f"Fatal error during scraping: {e}")
-        return []
 
 
+# Legacy synchronous wrapper (modified to accumulate results for backward compatibility if needed, though mostly used via async now)
 def scrape_all() -> list[ScrapedProduct]:
     """Synchronous wrapper for scrape_all_async."""
-    return asyncio.run(scrape_all_async())
+    results = []
+    async def collector(chunk):
+        results.extend(chunk)
+    
+    asyncio.run(scrape_all_async(on_chunk_callback=collector))
+    return results
 
 
 if __name__ == "__main__":

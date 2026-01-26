@@ -31,9 +31,10 @@ def get_deals_from_db(prefs: UserPreferences, session, brands_filter: list[str] 
         (PriceHistory.product_id == latest_price_subq.c.product_id) &
         (PriceHistory.recorded_at == latest_price_subq.c.max_recorded)
     ).filter(
-        (PriceHistory.reduced_price_per_kg <= prefs.max_price_per_kg) |
-        ((PriceHistory.reduced_price_per_kg == None) &
-         (PriceHistory.original_price_per_kg <= prefs.max_price_per_kg))
+        (PriceHistory.recorded_at >= datetime.utcnow() - timedelta(hours=48)) &
+        ((PriceHistory.reduced_price_per_kg <= prefs.max_price_per_kg) |
+         ((PriceHistory.reduced_price_per_kg == None) &
+          (PriceHistory.original_price_per_kg <= prefs.max_price_per_kg)))
     ).all()
 
     # Filter by brand and build result list

@@ -8,6 +8,7 @@ from scraper import ZooplusScraper
 from bot.formatter import format_alert_message, format_cheapest_variant_alert
 from services.deal_service import find_cheapest_variants
 
+
 logger = logging.getLogger(__name__)
 
 async def send_message_to_user(chat_id: str, message: str) -> bool:
@@ -129,99 +130,3 @@ async def send_alerts_grouped(product_price_ids: list[tuple[int, int]]) -> int:
 
     return alerts_sent
 
-async def background_scrape_and_notify(chat_id: str, prefs: UserPreferences, new_ceiling: float, specific_brands: list[str] = None) -> None:
-    """
-    Run a background scrape for a higher price range and notify user of new deals.
-    """
-    try:
-        logger.info(f"Starting background scrape for chat_id={chat_id}, new_ceiling={new_ceiling}, specific_brands={specific_brands}")
-        
-        # Note: Ideally this should use the shared browser instance from main, 
-        # but for on-demand scraped triggered by user commands, a fresh instance is acceptable 
-        # (or pass one if we restructure dependency injection). 
-        # For now, we instantiate scraper which will launch its own browser (legacy mode warning but functional).
-        scraper = ZooplusScraper()
-        
-        if specific_brands:
-            brands_to_scrape = specific_brands
-            include_defaults = False
-        else:
-            brands_to_scrape = prefs.get_brands_list()
-            include_defaults = True
-
-        # Scrape with new price ceiling
-        products = await scraper.scrape_brand_products(
-            brands_to_scrape if brands_to_scrape else None,
-            max_price_per_kg=new_ceiling,
-            include_default_brands=include_defaults
-        )
-
-        if not products:
-            logger.info(f"Background scrape found no new products")
-            return
-
-        # Filter to only products within the new range
-        session = get_session()
-        try:
-            new_deals_count = 0
-            
-            for scraped in products:
-                price_per_kg = scraped.reduced_price_per_kg or scraped.original_price_per_kg
-
-                if price_per_kg is None or price_per_kg > prefs.max_price_per_kg:
-                    continue
-
-                if not prefs.should_notify_for_brand(scraped.brand):
-                    continue
-
-                # Check if we already have this product
-                existing_product = session.query(Product).filter(
-                    Product.external_id == scraped.external_id
-                ).first()
-
-                if existing_product:
-                    # Check if already alerted
-                    existing_alert = session.query(AlertSent).filter(
-                        AlertSent.product_id == existing_product.id,
-                        AlertSent.price_at_alert == scraped.current_price,
-                        AlertSent.chat_id == chat_id
-                    ).first()
-                    if existing_alert:
-                        continue
-                
-                new_deals_count += 1
-
-                if new_deals_count <= 5:  # Limit background notifications
-                    msg = f"🔔 *New deal found!*\n\n"
-                    msg += f"*{scraped.brand or 'Unknown'}* - {scraped.name}\n"
-                    if scraped.size:
-                        msg += f"📦 {scraped.size}\n"
-                    msg += f"\n💰 *{scraped.current_price:.2f}€*"
-                    if price_per_kg:
-                        msg += f"\n📊 *{price_per_kg:.2f}€/kg*"
-                    site_name = scraped.site.capitalize() if scraped.site else "Store"
-                    msg += f"\n\n🔗 [View on {site_name}]({scraped.url})"
-
-                    success = await send_message_to_user(chat_id, msg)
-
-                    if success and existing_product:
-                        alert = AlertSent(
-                            product_id=existing_product.id,
-                            price_at_alert=scraped.current_price,
-                            chat_id=chat_id
-                        )
-                        session.add(alert)
-                        session.commit()
-
-            if new_deals_count > 5:
-                await send_message_to_user(chat_id, f"🔔 Found {new_deals_count - 5} more deals!")
-            elif new_deals_count > 0:
-                logger.info(f"Background scrape sent {new_deals_count} new deals to {chat_id}")
-            else:
-                logger.info(f"Background scrape found no new deals for {chat_id}")
-
-        finally:
-            session.close()
-
-    except Exception as e:
-        logger.error(f"Background scrape failed: {e}")

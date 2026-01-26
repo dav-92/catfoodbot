@@ -7,14 +7,15 @@ Monitors Zooplus.de for wet cat food sales and sends Telegram notifications.
 import asyncio
 import logging
 import sys
-from datetime import datetime
+from datetime import datetime, timedelta
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.interval import IntervalTrigger
 
 from config import settings
 from database import init_db
-from tracker import run_check
+from database import init_db
+from tracker import run_check, cleanup_old_offers
 from bot.application import create_bot_application, send_test_message
 
 logging.basicConfig(
@@ -37,6 +38,19 @@ async def scheduled_check():
             logger.info(f"Check completed: {stats}")
     except Exception as e:
         logger.error(f"Error during scheduled check: {e}")
+
+
+
+async def scheduled_cleanup():
+    """Run the daily cleanup of old offers."""
+    logger.info("Running scheduled database cleanup...")
+    try:
+        # Run synchronous cleanup in thread
+        count = await asyncio.to_thread(cleanup_old_offers, days_retention=7)
+        if count > 0:
+            logger.info(f"Cleanup finished: Removed {count} old records")
+    except Exception as e:
+        logger.error(f"Error during scheduled cleanup: {e}")
 
 
 async def run_bot_and_scheduler():
@@ -62,6 +76,17 @@ async def run_bot_and_scheduler():
         name="Hourly price check",
         next_run_time=datetime.now()  # Run immediately on start
     )
+    
+    # Schedule cleanup daily
+    scheduler.add_job(
+        scheduled_cleanup,
+        trigger=IntervalTrigger(days=1),
+        id="db_cleanup",
+        name="Daily database cleanup",
+        # Start cleanup 10 mins after startup to not interfere with initial check
+        next_run_time=datetime.now().replace(microsecond=0) + timedelta(minutes=10) 
+    )
+
     scheduler.start()
     logger.info(f"Scheduler started - checking every {settings.check_interval_hours} hour(s)")
 

@@ -1,7 +1,7 @@
 import re
 from datetime import datetime
-from sqlalchemy import create_engine, Column, Integer, String, Float, DateTime, Boolean, ForeignKey
 from sqlalchemy.orm import declarative_base, sessionmaker, relationship, joinedload
+from sqlalchemy import create_engine, Column, Integer, String, Float, DateTime, Boolean, ForeignKey, func
 
 from config import settings
 
@@ -285,3 +285,20 @@ def update_preferences(chat_id: str, **kwargs) -> UserPreferences:
 if __name__ == "__main__":
     init_db()
     print("Database initialized!")
+
+def get_product_statistics() -> list[dict]:
+    """Get product counts grouped by site and brand."""
+    session = get_session()
+    try:
+        stats = session.query(
+            Product.site, 
+            Product.brand, 
+            func.count(Product.id)
+        ).group_by(Product.site, Product.brand).order_by(Product.site, Product.brand).all()
+        
+        return [
+            {"site": site, "brand": brand, "count": count}
+            for site, brand, count in stats
+        ]
+    finally:
+        session.close()

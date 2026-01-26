@@ -5,7 +5,7 @@ from telegram.ext import Application, CommandHandler, CallbackQueryHandler
 
 from config import settings
 from bot.handlers import (
-    start_command, brands_command, addbrand_command, addbrand_callback, removebrand_command,
+    start_command, brands_command, addbrands_command, addbrand_callback, removebrands_command,
     listbrands_command, setmaxprice_command, status_command,
     reset_command, scrape_command, help_command
 )
@@ -23,9 +23,17 @@ def create_bot_application() -> Optional[Application]:
     # Add command handlers
     app.add_handler(CommandHandler("start", start_command))
     app.add_handler(CommandHandler("brands", brands_command))
-    app.add_handler(CommandHandler("addbrand", addbrand_command))
+    
+    # Add brands (with plural alias)
+    app.add_handler(CommandHandler("addbrand", addbrands_command))
+    app.add_handler(CommandHandler("addbrands", addbrands_command))
+    
     app.add_handler(CallbackQueryHandler(addbrand_callback, pattern="^addbrand:"))
-    app.add_handler(CommandHandler("removebrand", removebrand_command))
+    
+    # Remove brands (with plural alias)
+    app.add_handler(CommandHandler("removebrand", removebrands_command))
+    app.add_handler(CommandHandler("removebrands", removebrands_command))
+    
     app.add_handler(CommandHandler("listbrands", listbrands_command))
     app.add_handler(CommandHandler("setmaxprice", setmaxprice_command))
     app.add_handler(CommandHandler("status", status_command))

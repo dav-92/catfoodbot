@@ -11,10 +11,10 @@ from services.deal_service import (
     format_freshness_string,
     find_cheapest_variants
 )
-from services.alert_service import background_scrape_and_notify
 from bot.formatter import format_cheapest_variant_alert
 from scraper import ZooplusScraper
 from tracker import run_check
+
 
 logger = logging.getLogger(__name__)
 AVAILABLE_BRANDS = ZooplusScraper.BRANDS
@@ -51,8 +51,8 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"Brands: {brands_text}\n\n"
             "*Commands:*\n"
             "/setmaxprice - Change max price\n"
-            "/addbrand - Add brands to watch\n"
-            "/removebrand - Remove brands\n"
+            "/addbrands - Add brands to watch\n"
+            "/removebrands - Remove brands\n"
             "/brands - Show watched brands\n"
             "/status - Check settings",
             parse_mode="Markdown"
@@ -66,9 +66,9 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "2️⃣ Choose brands: /addbrand MAC's, Wild Freedom\n\n"
             "You'll automatically receive alerts once configured!\n\n"
             "*All commands:*\n"
-            "/setmaxprice <price> - Set max €/kg\n"
-            "/addbrand <name> - Add brand(s)\n"
-            "/removebrand <name> - Remove brand\n"
+            "/setmaxprice <price> - Set max €/kg (max 10.00)\n"
+            "/addbrands <names> - Add brand(s)\n"
+            "/removebrands <names> - Remove brand(s)\n"
             "/brands - Show watched brands\n"
             "/listbrands - All available brands\n"
             "/status - Check settings",
@@ -85,14 +85,14 @@ async def brands_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         brand_list = "\n".join(f"  • {b}" for b in brands)
         await update.message.reply_text(
             f"📋 *Your Watched Brands*\n\n{brand_list}\n\n"
-            f"Use /addbrand or /removebrand to modify.",
+            f"Use /addbrands or /removebrands to modify.",
             parse_mode="Markdown"
         )
     else:
         await update.message.reply_text(
             "📋 No brands configured yet.\n\n"
-            "Use /addbrand <name> to add brands to watch.\n"
-            "Example: /addbrand MAC's, Wild Freedom",
+            "Use /addbrands <names> to add brands to watch.\n"
+            "Example: /addbrands MAC's Wild Freedom",
             parse_mode="Markdown"
         )
 
@@ -159,17 +159,17 @@ def find_brand_suggestions(query: str, limit: int = 5) -> list[str]:
     return matches[:limit]
 
 
-async def addbrand_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle /addbrand command."""
+async def addbrands_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle /addbrands command (and alias /addbrand)."""
     chat_id = str(update.effective_chat.id)
 
     if not context.args:
         await update.message.reply_text(
-            "Usage: /addbrand <brand name(s)>\n\n"
+            "Usage: /addbrands <brand name(s)>\n\n"
             "Examples:\n"
-            "  /addbrand Animonda\n"
-            "  /addbrand macs wild freedom leonardo\n"
-            "  /addbrand MAC's, Wild Freedom, Leonardo\n\n"
+            "  /addbrands Animonda\n"
+            "  /addbrands macs wild freedom leonardo\n"
+            "  /addbrands MAC's, Wild Freedom, Leonardo\n\n"
             "Use /listbrands to see available brands."
         )
         return
@@ -268,9 +268,10 @@ async def addbrand_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         "🔄 No data for this brand yet. Checking for deals...",
                         parse_mode="Markdown"
                     )
-                    asyncio.create_task(background_scrape_and_notify(
-                        chat_id, prefs, prefs.max_price_per_kg, specific_brands=added_brands
-                    ))
+                    await update.message.reply_text(
+                        "🔄 No data for this brand yet. Wait for next scheduled scrape.",
+                        parse_mode="Markdown"
+                    )
                 else:
                     await update.message.reply_text(
                         "No deals found under your max price for these brand(s).",
@@ -334,15 +335,29 @@ async def addbrand_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     finally:
         session.close()
 
-async def removebrand_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle /removebrand command."""
+async def removebrands_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle /removebrands command (and alias /removebrand)."""
     chat_id = str(update.effective_chat.id)
 
     if not context.args:
-        await update.message.reply_text("Usage: /removebrand <brand name>")
+        await update.message.reply_text(
+            "Usage: /removebrands <brand names>\n"
+            "Example: /removebrands macs wild freedom"
+        )
         return
 
-    brand = " ".join(context.args)
+    # Parse inputs using the same logic as addbrands
+    input_text = " ".join(context.args)
+    brands_to_remove = parse_brand_input(input_text)
+    
+    # If parsing failed to find known brands, fall back to simple word splitting
+    # This allows removing brands that might be stored but not in AVAILABLE_BRANDS (e.g. from migrations)
+    if not brands_to_remove:
+        if "," in input_text:
+             brands_to_remove = [b.strip() for b in input_text.split(",") if b.strip()]
+        else:
+             brands_to_remove = input_text.split()
+
     session = get_session()
     try:
         prefs = session.query(UserPreferences).filter(
@@ -353,21 +368,44 @@ async def removebrand_command(update: Update, context: ContextTypes.DEFAULT_TYPE
             await update.message.reply_text("No brands configured yet.")
             return
 
-        if prefs.remove_brand(brand):
-            session.commit()
+        removed = []
+        not_found = []
+
+        for brand in brands_to_remove:
+            # Try exact match first
+            if prefs.remove_brand(brand):
+                removed.append(brand)
+                continue
+            
+            # Try case-insensitive match against user's list
+            user_brands = prefs.get_brands_list()
+            matched = False
+            for user_brand in user_brands:
+                if user_brand.lower() == brand.lower():
+                    if prefs.remove_brand(user_brand):
+                        removed.append(user_brand)
+                        matched = True
+                        break
+            
+            if not matched:
+                not_found.append(brand)
+
+        session.commit()
+        
+        msg_parts = []
+        if removed:
             remaining = prefs.get_brands_list()
+            msg_parts.append(f"✅ Removed: {', '.join(removed)}")
             if remaining:
-                await update.message.reply_text(
-                    f"✅ Removed *{brand}*\n\nRemaining: {', '.join(remaining)}",
-                    parse_mode="Markdown"
-                )
+                msg_parts.append(f"Remaining: {', '.join(remaining)}")
             else:
-                await update.message.reply_text(
-                    f"✅ Removed *{brand}*\n\nNo brands left. Use /addbrand to add more.",
-                    parse_mode="Markdown"
-                )
-        else:
-            await update.message.reply_text(f"❌ *{brand}* not found in your watch list.", parse_mode="Markdown")
+                msg_parts.append("No brands left. Use /addbrands to add more.")
+        
+        if not_found:
+            msg_parts.append(f"❌ Not found: {', '.join(not_found)}")
+            
+        await update.message.reply_text("\n\n".join(msg_parts), parse_mode="Markdown")
+
     finally:
         session.close()
 
@@ -376,7 +414,7 @@ async def listbrands_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
     brands_list = "\n".join(f"  • {b}" for b in sorted(AVAILABLE_BRANDS))
     await update.message.reply_text(
         f"🏷️ *Available Brands*\n\n{brands_list}\n\n"
-        f"Use /addbrand <name> to watch a brand.",
+        f"Use /addbrands <name> to watch a brand.",
         parse_mode="Markdown"
     )
 
@@ -434,10 +472,17 @@ async def setmaxprice_command(update: Update, context: ContextTypes.DEFAULT_TYPE
         max_price = float(value.replace(",", "."))
         if max_price <= 0:
             raise ValueError("Price must be positive")
+        if max_price > 10.0:
+            await update.message.reply_text(
+                "❌ Max allowable price is *10.00€/kg*.\n"
+                "The bot only tracks deals up to this limit.",
+                parse_mode="Markdown"
+            )
+            return
     except ValueError:
         await update.message.reply_text(
             "❌ Invalid price. Please enter a number.\n"
-            "Example: /setmaxprice 15.00"
+            "Example: /setmaxprice 7.50"
         )
         return
 
@@ -477,10 +522,9 @@ async def setmaxprice_command(update: Update, context: ContextTypes.DEFAULT_TYPE
 
         if not has_data_for_price_range(max_price):
             await update.message.reply_text(
-                "🔄 No cached data yet. Checking for deals...",
+                "🔄 No cached data for this range yet. Wait for next scheduled scrape.",
                 parse_mode="Markdown"
             )
-            asyncio.create_task(background_scrape_and_notify(chat_id, prefs, max_price))
 
     finally:
         session.close()
