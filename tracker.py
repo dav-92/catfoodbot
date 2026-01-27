@@ -167,7 +167,7 @@ def check_under_max_price(product: Product, price: PriceHistory, chat_id: str) -
     price_per_kg = price.reduced_price_per_kg
     if price_per_kg is None and price.original_price_per_kg is not None:
         # If there's a discount, calculate the reduced price per kg
-        if price.discount_percent > 0:
+        if price.discount_percent > 0 and price.discount_percent < 100:
             price_per_kg = round(price.original_price_per_kg * (1 - price.discount_percent / 100), 2)
         else:
             price_per_kg = price.original_price_per_kg
@@ -271,12 +271,13 @@ def _save_products_batch_sync(products: list[ScrapedProduct]) -> tuple[dict, lis
                     # Collect for grouped sending instead of sending immediately
                     products_to_alert.append((fresh_product.id, fresh_price.id))
 
+                # Commit each product individually to avoid losing all progress on a single failure
+                session.commit()
+
             except Exception as e:
                 logger.error(f"Error processing product {scraped.name}: {e}")
                 session.rollback()
-        
-        # Commit all changes at the end
-        session.commit()
+                # Continue with next product instead of losing all previous work
         
     finally:
         session.close()

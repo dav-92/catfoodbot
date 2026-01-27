@@ -33,7 +33,7 @@ def get_deals_from_db(prefs: UserPreferences, session, brands_filter: list[str] 
     ).filter(
         (PriceHistory.recorded_at >= datetime.utcnow() - timedelta(hours=48)) &
         ((PriceHistory.reduced_price_per_kg <= prefs.max_price_per_kg) |
-         ((PriceHistory.reduced_price_per_kg == None) &
+         (PriceHistory.reduced_price_per_kg.is_(None) &
           (PriceHistory.original_price_per_kg <= prefs.max_price_per_kg)))
     ).all()
 
@@ -69,7 +69,7 @@ def has_data_for_price_range(max_price: float) -> bool:
             or_(
                 PriceHistory.reduced_price_per_kg <= max_price,
                 and_(
-                    PriceHistory.reduced_price_per_kg == None,
+                    PriceHistory.reduced_price_per_kg.is_(None),
                     PriceHistory.original_price_per_kg <= max_price
                 )
             )

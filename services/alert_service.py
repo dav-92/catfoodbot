@@ -79,7 +79,7 @@ async def send_alerts_grouped(product_price_ids: list[tuple[int, int]]) -> int:
 
         # Get all configured users
         all_users = session.query(UserPreferences).filter(
-            UserPreferences.max_price_per_kg != None
+            UserPreferences.max_price_per_kg.isnot(None)
         ).all()
 
         for prefs in all_users:

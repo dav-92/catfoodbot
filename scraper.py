@@ -324,11 +324,12 @@ class BeautifulSoupScraper(BaseScraper):
                     # Wait for product cards
                     try:
                         await page.wait_for_selector('[class*="ProductCard"]', timeout=15000)
-                    except:
+                    except Exception as e:
+                        logger.debug(f"ProductCard selector not found, trying fallback: {e}")
                         try:
                             await page.wait_for_selector('[class*="product"]', timeout=5000)
-                        except:
-                            pass
+                        except Exception as e2:
+                            logger.debug(f"Fallback product selector also not found: {e2}")
 
                     # Scroll
                     await page.evaluate("window.scrollTo(0, document.body.scrollHeight / 2)")
@@ -343,26 +344,30 @@ class BeautifulSoupScraper(BaseScraper):
                 # Legacy method: launch new browser (should be avoided)
                 async with async_playwright() as p:
                     browser = await p.chromium.launch(headless=True)
-                    # ... (rest of legacy logic, but we should just use the shared one)
-                    # For brevity in this refactor, let's just error or assume browser is passed
                     logger.warning("No browser instance provided to Scraper - launching for single use (slow!)")
-                    # ... [fallback logic if needed, but we aim to replace calls]
-                    # Retaining fallback for safety for now:
-                    context = await browser.new_context(
-                        locale='de-DE',
-                        user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
-                    )
-                    page = await context.new_page()
-                    await page.goto(url, wait_until='networkidle', timeout=60000)
-                    # ... waiting logic ...
+                    context = None
+                    page = None
                     try:
-                         await page.wait_for_selector('[class*="ProductCard"]', timeout=15000)
-                    except: pass
-                    await page.evaluate("window.scrollTo(0, document.body.scrollHeight / 2)")
-                    await asyncio.sleep(1)
-                    html = await page.content()
-                    await browser.close()
-                    return html
+                        context = await browser.new_context(
+                            locale='de-DE',
+                            user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+                        )
+                        page = await context.new_page()
+                        await page.goto(url, wait_until='networkidle', timeout=60000)
+                        try:
+                            await page.wait_for_selector('[class*="ProductCard"]', timeout=15000)
+                        except Exception as e:
+                            logger.debug(f"ProductCard selector not found in fallback path: {e}")
+                        await page.evaluate("window.scrollTo(0, document.body.scrollHeight / 2)")
+                        await asyncio.sleep(1)
+                        html = await page.content()
+                        return html
+                    finally:
+                        if page:
+                            await page.close()
+                        if context:
+                            await context.close()
+                        await browser.close()
 
         except Exception as e:
             logger.error(f"Failed to fetch {url}: {e}")
@@ -1501,7 +1506,7 @@ class ZooroyalScraper(BaseScraper):
         is_on_sale = False
         sale_tag = None
 
-        if discount_percent:
+        if discount_percent and discount_percent < 100:
             # Current price is already discounted, calculate original
             original_price = round(current_price / (1 - discount_percent / 100), 2)
             is_on_sale = True

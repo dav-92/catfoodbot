@@ -77,7 +77,8 @@ def format_cheapest_variant_alert(
             msg += f"\n📊 {price_per_kg:.2f}€/kg"
 
     # Show all sites where product is available (including main product)
-    all_sites = [(product.site.capitalize(), price_per_kg, product.url)]
+    site_name = product.site.capitalize() if product.site else "Store"
+    all_sites = [(site_name, price_per_kg, product.url)]
     if other_sites:
         all_sites.extend(other_sites)
 
