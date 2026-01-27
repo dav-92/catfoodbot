@@ -99,9 +99,9 @@ async def send_alerts_grouped(product_price_ids: list[tuple[int, int]]) -> int:
             cheapest_deals = find_cheapest_variants(user_products)
 
             for cheapest_product, cheapest_price, _, other_sites in cheapest_deals:
-                # Check if already alerted for this cheapest variant
+                # Check if already alerted for this match_key (cross-site duplicate detection)
                 existing = session.query(AlertSent).filter(
-                    AlertSent.product_id == cheapest_product.id,
+                    AlertSent.match_key == cheapest_product.match_key,
                     AlertSent.price_at_alert == cheapest_price.current_price,
                     AlertSent.chat_id == prefs.chat_id
                 ).first()
@@ -117,6 +117,7 @@ async def send_alerts_grouped(product_price_ids: list[tuple[int, int]]) -> int:
                 if success:
                     alert = AlertSent(
                         product_id=cheapest_product.id,
+                        match_key=cheapest_product.match_key,
                         price_at_alert=cheapest_price.current_price,
                         chat_id=prefs.chat_id
                     )

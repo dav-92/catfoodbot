@@ -25,6 +25,11 @@ def generate_match_key(brand: str, size: str, name: str = None) -> str:
     brand_norm = re.sub(r"[''`´]", "", brand_norm)  # Remove apostrophes
     brand_norm = re.sub(r"[^a-z0-9]", "", brand_norm)  # Keep only alphanumeric
 
+    # Handle known brand variations for cross-site matching
+    # "MAC's Cat" (zooroyal) should match "MAC's" (zooplus/bitiba)
+    if brand_norm == "macscat":
+        brand_norm = "macs"
+
     # Normalize size: remove spaces, lowercase
     size_norm = ""
     if size:
@@ -112,6 +117,7 @@ class AlertSent(Base):
 
     id = Column(Integer, primary_key=True)
     product_id = Column(Integer, ForeignKey("products.id"), nullable=False)
+    match_key = Column(String, default="")  # Cross-site match key for duplicate detection
     price_at_alert = Column(Float, nullable=False)
     chat_id = Column(String, default="")  # Which user received this alert
     sent_at = Column(DateTime, default=datetime.utcnow)

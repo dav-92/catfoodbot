@@ -606,6 +606,7 @@ async def reset_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
                 alert = AlertSent(
                     product_id=product.id,
+                    match_key=product.match_key,
                     price_at_alert=price.current_price,
                     chat_id=chat_id
                 )
